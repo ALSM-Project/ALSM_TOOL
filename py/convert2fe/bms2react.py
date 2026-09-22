@@ -230,13 +230,13 @@ def convert_dfhmdf_input(define_data):
         else ""
     )
 
-    tsx_type = f'type=\'{"number" if "NUM" in define_data["attrb"] else "text"}\''
-    disabled = "disabled" if "PROT" in define_data["attrb"] else ""
+    tsx_type = f'type=\'{"number" if "NUM" in define_data.get("attrb", []) else "text"}\''
+    disabled = "disabled" if "PROT" in define_data.get("attrb", []) else ""
 
     if "name" in define_data:
         tsx_id = f'name=\'{define_data["name"]}\''.lower()
         tsx_name = f'id=\'{define_data["name"]}\''.lower()
-        if not disabled and "ASKIP" not in define_data["attrb"]:
+        if not disabled and "ASKIP" not in define_data.get("attrb", []):
             on_change_function = "onChange={handleInputChange}"
             on_keydown_function = "onKeyDown={handleSubmit}"
     tag = f"<Input {max_length} {tsx_id} {tsx_name} {tsx_type} {color} {disabled} {on_change_function} {on_keydown_function}/>"
