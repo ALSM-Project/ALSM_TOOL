@@ -1,16 +1,111 @@
 '''
 bms2react.py
 
-This script converts BMS files into corresponding React components. It parses BMS files, extracts information about map items, and generates React components based on the extracted data.
+Converts CICS BMS mapsets (DFHMSD/DFHMDI/DFHMDF) into runnable React 19 +
+TypeScript screens that are a faithful, position-accurate replica of the
+original 3270 "green screen": every field keeps its exact BMS row/col/length
+and is placed on a CSS character grid sized to the map's own SIZE=(rows,cols),
+styled dark-terminal/monospace with the real 3270 COLOR mapped to a readable
+equivalent - not a restyled "modern form" that only approximates the content.
 
-Author: KhangNV19
-Date: 2024-01-15
+Pipeline per BMS file:
+  1. extract_map_items()   - parse DFHMSD/DFHMDI/DFHMDF statements into flat dicts,
+                              correctly rejoining INITIAL text that continues onto a
+                              second physical line (BMS column-72/column-16 rule).
+  2. build_screen_model()  - classify every field (input / output / static label /
+                              skip), detect repeating field groups (e.g. CRDSEL1..7)
+                              as table rows, and pull out the function-key legend
+                              line (e.g. "ENTER=Sign-on  F3=Exit"). Every surviving
+                              field keeps its own row/col/length - there is no
+                              label/helper pairing or header/title extraction,
+                              because placing each field at its real position
+                              reproduces those relationships for free. This model
+                              is also written out as <MAP>.model.json for inspection.
+  3. build_component()     - renders the model into a single self-contained .tsx
+                              file: one CSS-grid canvas (sized to the map's real
+                              SIZE=(rows,cols)) holding every field positioned at
+                              its exact gridRow/gridColumn, a repeating-group table
+                              where detected, a conditional ERRMSG/INFOMSG region,
+                              and a window keydown handler wired to the real
+                              function keys (Enter/F3/F4/F5/F7/F8/F12/...).
+
+Author: KhangNV19 (original), extended 2026 to follow the BMS->React modernization
+spec (intermediate model, real field classification, position-accurate terminal
+replica, repeating-group tables, PF-key wiring, ERRMSG/INFOMSG alerts).
 '''
 import argparse
 import os
 import re
 import json
 
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# 3270 COLOR -> Tailwind text color readable on the black terminal background the
+# generated screen now renders on, matching a real TN3270 emulator's palette
+# instead of being restyled for a light modern UI.
+COLOR_TOKEN_MAP = {
+    'BLUE': 'text-blue-400',
+    'TURQUOISE': 'text-cyan-400',
+    'GREEN': 'text-green-400',
+    'YELLOW': 'text-yellow-300',
+    'RED': 'text-red-400',
+    'PINK': 'text-pink-400',
+    'NEUTRAL': 'text-slate-200',
+    # No COLOR= clause at all defaults to classic green-screen green, not black-on-black.
+    'DEFAULT': 'text-green-400',
+}
+
+# BMS HILIGHT value -> extra Tailwind class (on top of BRT -> font-semibold).
+HILIGHT_TOKEN_MAP = {
+    'UNDERLINE': 'underline',
+    'BLINK': 'animate-pulse',
+    # Real inverse video: swap foreground/background instead of just bolding text.
+    'REVERSE': 'bg-green-400 text-black',
+}
+
+# A real 3270 Model 2 screen is 24 rows x 80 columns; DFHMDI's own SIZE=(rows,cols)
+# overrides this when present. The generated grid is sized to this exactly so every
+# field's row/col lines up pixel-for-pixel with the original map.
+DEFAULT_GRID_ROWS = 24
+DEFAULT_GRID_COLS = 80
+
+# Real function-key legend line, e.g. "ENTER=Sign-on  F3=Exit  F7=Backward F8=Forward".
+# Real CardDemo maps use either convention - COPAU01 double-spaces between keys, but
+# COACTUP's FKEYS field (LENGTH=21, no room to spare) single-spaces them
+# ('ENTER=Process F3=Exit') - requiring 2+ spaces silently dropped the first key on
+# every tightly-packed field. The lookahead already disambiguates "is the next token
+# a real key=value pair" independently of how much whitespace precedes it (so a
+# multi-word label like "Mark/Remove Fraud" still isn't split early), so 1+ spaces
+# is both necessary and sufficient.
+FUNCTION_KEY_LEGEND_RE = re.compile(
+    r'(ENTER|PF\d{1,2}|F\d{1,2})\s*=\s*([^=]*?)(?=\s+(?:ENTER|PF\d{1,2}|F\d{1,2})\s*=|$)',
+    re.IGNORECASE,
+)
+
+# Repeating field group naming convention, e.g. CRDSEL1, ACCTNO12
+GROUP_NAME_RE = re.compile(r'^([A-Za-z]+)(\d{1,3})$')
+
+# A field's own INITIAL is a pure placeholder/underline (not real text) when it is
+# entirely made of one decorative character (e.g. '________' on a password field).
+DECORATIVE_INITIAL_RE = re.compile(r'^[_\-\.\s]*$')
+
+PF_KEY_TO_JS_KEY = {
+    'ENTER': 'Enter',
+    'PF3': 'F3', 'F3': 'F3',
+    'PF4': 'F4', 'F4': 'F4',
+    'PF5': 'F5', 'F5': 'F5',
+    'PF7': 'F7', 'F7': 'F7',
+    'PF8': 'F8', 'F8': 'F8',
+    'PF12': 'F12', 'F12': 'F12',
+}
+
+
+# ---------------------------------------------------------------------------
+# Step 1: low-level BMS parsing
+# ---------------------------------------------------------------------------
 
 def get_value(search_result):
     """
@@ -29,16 +124,49 @@ def get_value(search_result):
             value = find_match.group(0)
     elif not search_result.find(")") == -1:
         value = (
-            search_result[search_result.find("=") + 1 :]
+            search_result[search_result.find("=") + 1:]
             .replace("(", "")
             .replace(")", "")
             .split(",")
         )
     elif search_result.find(")") == -1:
-        value = search_result[search_result.find("=") + 1 :]
-    if value[0] == "'" and value[-1] == "'":
+        value = search_result[search_result.find("=") + 1:]
+    if value and value[0] == "'" and value[-1] == "'":
         value = value.removeprefix("'").removesuffix("'")
     return value
+
+
+def normalize_continued_text(raw):
+    """
+    Rejoins a BMS INITIAL value that was split across physical lines.
+
+    BMS fixed format: a non-blank character in column 72 means the statement
+    continues on the next line, resuming at column 16. Real example (CardDemo
+    COSGN00, unnamed field at row 17):
+        INITIAL='Type your User ID and Password, then press ENTE-
+                       R:'
+    must become "Type your User ID and Password, then press ENTER:" - direct
+    concatenation, no inserted space, no leftover '-' or indentation.
+
+    Also un-escapes '&&' (BMS escaping for a literal '&') to '&'.
+    """
+    if not raw:
+        return raw
+    if "\n" not in raw:
+        return raw.replace("&&", "&")
+    lines = raw.split("\n")
+    result = lines[0]
+    for cont in lines[1:]:
+        if result.endswith("-"):
+            result = result[:-1]
+        # Continuation content starts at column 16 (index 15). Fall back to a
+        # plain lstrip if the line is shorter/irregular rather than losing data.
+        if len(cont) > 15 and cont[:15].strip() == "":
+            stripped = cont[15:]
+        else:
+            stripped = cont.lstrip()
+        result += stripped
+    return result.replace("&&", "&")
 
 
 def extract_property(current_item):
@@ -59,11 +187,15 @@ def extract_property(current_item):
     pattern_term = re.compile(r"TERM\s*=\s*([A-Za-z0-9]+)")
     pattern_tioapfx = re.compile(r"TIOAPFX\s*=\s*([A-Z]+)")
     pattern_pos = re.compile(r"POS=\((\d+),(\d+)\)")
+    pattern_size = re.compile(r"SIZE=\((\d+),(\d+)\)")
     pattern_length = re.compile(r"LENGTH=(\d+)")
-    pattern_initial = re.compile(r"INITIAL=\'.*\'", re.DOTALL)
-    pattern_title = re.compile(r"TITLE \'.*\'", re.DOTALL)
+    pattern_initial = re.compile(r"INITIAL='(.*?)'", re.DOTALL)
     pattern_title = re.compile(r"TITLE \'(.+?)\'")
     pattern_color = re.compile(r"COLOR\s*=\s*([A-Za-z0-9]+)")
+    pattern_hilight = re.compile(r"HILIGHT\s*=\s*([A-Z]+)")
+    pattern_picin = re.compile(r"PICIN\s*=\s*'([^']*)'")
+    pattern_picout = re.compile(r"PICOUT\s*=\s*'([^']*)'")
+    pattern_justify = re.compile(r"JUSTIFY\s*=\s*\(([^)]*)\)")
     pattern_occurs = re.compile(r"OCCURS\s*=\s*([0-9]+)")
     pattern_mapatts = re.compile(r"MAPATTS\s*=\s*(?:\(([A-Z,]+)\)|([A-Z]+))")
     pattern_attrb = re.compile(r"ATTRB\s*=\s*(?:\(([A-Z,]+)\)|([A-Z]+))")
@@ -106,19 +238,35 @@ def extract_property(current_item):
         search = pattern_tioapfx.search(current_item).group(0)
         data["tioapfx"] = get_value(search)
     if pattern_pos.search(current_item):
-        search = pattern_pos.search(current_item).group(0)
-        data["pos"] = get_value(search)
+        m = pattern_pos.search(current_item)
+        data["pos"] = [m.group(1), m.group(2)]
+        data["row"] = int(m.group(1))
+        data["col"] = int(m.group(2))
+    if pattern_size.search(current_item):
+        m = pattern_size.search(current_item)
+        data["size"] = (int(m.group(1)), int(m.group(2)))
     if pattern_length.search(current_item):
         search = pattern_length.search(current_item).group(0)
-        data["length"] = get_value(search)
+        data["length"] = int(get_value(search))
     if pattern_initial.search(current_item):
-        search = pattern_initial.search(current_item).group(0)
+        raw_initial = pattern_initial.search(current_item).group(1)
         start_with_uppercase_pattern = re.compile(r"\*+\s*[A-Z]+")
         start_with_lowercase_pattern = re.compile(r"\*+\s*[a-z.]+")
+        cleaned = raw_initial
         if start_with_lowercase_pattern.search(current_item):
-            data["initial"] = re.sub(r"(\s*)(\*+)(\s*)", r"", get_value(search))
+            cleaned = re.sub(r"(\s*)(\*+)(\s*)", r"", raw_initial)
         elif start_with_uppercase_pattern.search(current_item):
-            data["initial"] = re.sub(r"(\s*)(\*+)(\s*)", r" ", get_value(search))
+            cleaned = re.sub(r"(\s*)(\*+)(\s*)", r" ", raw_initial)
+        data["initial"] = normalize_continued_text(cleaned)
+    if pattern_hilight.search(current_item):
+        search = pattern_hilight.search(current_item).group(0)
+        data["hilight"] = get_value(search)
+    if pattern_picin.search(current_item):
+        data["picin"] = pattern_picin.search(current_item).group(1)
+    if pattern_picout.search(current_item):
+        data["picout"] = pattern_picout.search(current_item).group(1)
+    if pattern_justify.search(current_item):
+        data["justify"] = [v.strip() for v in pattern_justify.search(current_item).group(1).split(",") if v.strip()]
     if pattern_mapatts.search(current_item):
         search = pattern_mapatts.search(current_item).group(0)
         data["mapatts"] = get_value(search)
@@ -126,10 +274,12 @@ def extract_property(current_item):
         search = pattern_attrb.search(current_item).group(0)
         data["attrb"] = get_value(search)
     else:
-        pattern_attrb = re.compile(r"ATTRB\s*=\s*([A-Za-z0-9]+)")
-        if pattern_attrb.search(current_item):
-            search = pattern_attrb.search(current_item).group(0)
+        pattern_attrb_bare = re.compile(r"ATTRB\s*=\s*([A-Za-z0-9]+)")
+        if pattern_attrb_bare.search(current_item):
+            search = pattern_attrb_bare.search(current_item).group(0)
             data["attrb"] = get_value(search)
+    if "attrb" in data and isinstance(data["attrb"], str):
+        data["attrb"] = [data["attrb"]] if data["attrb"] else []
     if pattern_color.search(current_item):
         search = pattern_color.search(current_item).group(0)
         data["color"] = get_value(search)
@@ -165,398 +315,677 @@ def extract_map_items(file_path):
                 map_items.append(data)
                 current_item = new_item
                 new_item = ""
-        # data = extract_property(current_item)
-        # map_items.append(data)
         file.close()
     return map_items
 
 
-def convert_dfhmsd(define_data):
+# ---------------------------------------------------------------------------
+# Step 2: intermediate model - classification, grouping, layout planning
+# ---------------------------------------------------------------------------
+
+def is_field_definition(item):
+    return item.get("define") == "DFHMDF" and "length" in item
+
+
+def extract_grid_size(map_items):
+    """Real screen dimensions from the map's own DFHMDI SIZE=(rows,cols), falling
+    back to the standard 3270 Model 2 size (24x80) when absent."""
+    for item in map_items:
+        if item.get("define") == "DFHMDI" and "size" in item:
+            return item["size"]
+    return (DEFAULT_GRID_ROWS, DEFAULT_GRID_COLS)
+
+
+def classify_field(field):
     """
-    Converts DFHMSD define data to React code.
-
-    Parameters:
-    - define_data (dict): Dictionary containing DFHMSD define data.
-
-    Returns:
-    - str: React code for DFHMSD.
+    Classifies one DFHMDF field per the modernization spec:
+      - named + UNPROT               -> 'input'  (user enters data)
+      - named + ASKIP/PROT (default) -> 'output' (server-supplied display value)
+      - unnamed + has INITIAL        -> 'label'  (static text)
+      - unnamed + UNPROT/DRK         -> 'skip'   (technical field, no business meaning)
+      - anything else unnamed        -> 'skip'
+    A missing ATTRB clause defaults to ASKIP (read-only), per real BMS semantics.
     """
-    if "type" in define_data:
-        if define_data["type"] == "FINAL":
-            return ""
-    title = define_data["title"] if "title" in define_data else ""
-    react_code = f"""
-    <Helmet>
-        <title>{title if title else "Untitle"}</title>
-    </Helmet>
+    if field.get("length", 0) == 0:
+        return "skip"
+    attrb = field.get("attrb", [])
+    name = field.get("name")
+    is_unprot = "UNPROT" in attrb
+    if name:
+        if is_unprot:
+            return "input"
+        # DRK without UNPROT is a real, if unusual, BMS combination: a named,
+        # protected field that is deliberately invisible on the 3270 (DRK means
+        # "dark" regardless of protection). It is an internal bookkeeping value
+        # (e.g. CardDemo's CRDSTPn), not something a user should ever see - the
+        # modernized screen must not surface it just because it has a name.
+        if "DRK" in attrb:
+            return "skip"
+        return "output"
+    if is_unprot or "DRK" in attrb:
+        return "skip"
+    if field.get("initial"):
+        return "label"
+    return "skip"
+
+
+def css_class_for(field):
+    """3270 COLOR/HILIGHT/BRT/JUSTIFY -> semantic Tailwind classes (never a raw color
+    name)."""
+    color = (field.get("color") or "DEFAULT").upper()
+    classes = [COLOR_TOKEN_MAP.get(color, COLOR_TOKEN_MAP["DEFAULT"])]
+    attrb = field.get("attrb", [])
+    if "BRT" in attrb:
+        classes.append("font-semibold")
+    hilight = (field.get("hilight") or "").upper()
+    if hilight and hilight != "OFF":
+        classes.append(HILIGHT_TOKEN_MAP.get(hilight, ""))
+    if field.get("isJustifyRight"):
+        classes.append("text-right")
+    return " ".join(c for c in classes if c).strip()
+
+
+def parse_picture_edit(mask):
     """
-    return react_code
-
-
-def convert_dfhmdi(define_data):
+    Parses the handful of COBOL numeric-edit symbols actually present in this
+    project's real BMS source (e.g. PICOUT='+ZZZ,ZZZ,ZZZ.99') into what's needed to
+    format a value the same way at render time: how many decimal places, and
+    whether there's a floating +/- sign. Returns None for anything that isn't a
+    recognizable numeric edit mask (e.g. a plain PICIN digit-count string with no
+    '.', '+', '-', or 'Z', which is just an input length constraint, not a display
+    format).
     """
-    Converts DFHMDI define data to React code.
+    if not mask:
+        return None
+    has_sign = mask[0] in ("+", "-")
+    has_edit_symbol = any(c in mask for c in "Z.,")
+    if not has_sign and not has_edit_symbol:
+        return None
+    decimals = 0
+    if "." in mask:
+        decimals = sum(1 for c in mask.rsplit(".", 1)[1] if c in "9Z0")
+    return {"sign": has_sign, "decimals": decimals}
 
-    Parameters:
-    - define_data (dict): Dictionary containing DFHMDI define data.
 
-    Returns:
-    - str: React code for DFHMDI.
+def is_decorative_initial(text):
+    return bool(DECORATIVE_INITIAL_RE.match(text or ""))
+
+
+
+
+def detect_function_keys(candidate_fields):
     """
-    react_code = ""
-    return react_code
+    Finds the function-key legend line(s) (e.g. "ENTER=Sign-on  F3=Exit") among the
+    candidate fields and returns the parsed, merged [{key, action, label}] list used
+    to wire the real keyboard handler. This is a pure scan - every field keeps
+    rendering normally wherever build_screen_model places it (the legend text is
+    real on-screen content too, not something to hide once parsed).
 
+    The legend is usually unnamed static text (kind 'label'), but some BMS maps
+    (e.g. CardDemo's COACTUP/COCRDSL/COCRDUP/COTRTUP) instead give this same text
+    to a NAMED, protected field (e.g. "FKEYS") so the program can swap it at
+    runtime - classify_field() correctly calls that 'output', not 'label', per
+    real BMS semantics. Scanning only 'label' fields silently dropped the legend
+    - and with it every keyboard handler - on exactly those screens. candidate_fields
+    must include both kinds so this is found either way.
 
-def convert_dfhmdf_input(define_data):
+    Some maps (e.g. CardDemo's COTRTLI) go further and split the legend across
+    several separate single-key fields (BUTNF02="F2=Add", BUTNF03="F3=Exit", ...)
+    instead of one combined line. Every matching field is scanned and merged into
+    one list (in field order) rather than stopping at the first match, so none of
+    these per-key fields are silently dropped either.
     """
-    Converts DFHMDF define data to React code.
+    keys = []
+    for field in candidate_fields:
+        text = field.get("initial") or ""
+        matches = list(FUNCTION_KEY_LEGEND_RE.finditer(text))
+        if len(matches) >= 1 and "=" in text:
+            for m in matches:
+                raw_key = m.group(1).upper()
+                label = m.group(2).strip()
+                js_key = PF_KEY_TO_JS_KEY.get(raw_key, raw_key)
+                action = "ENTER" if raw_key == "ENTER" else re.sub(r"^F", "PF", raw_key)
+                keys.append({"key": js_key, "action": action, "label": label or action})
+    return keys
 
-    Parameters:
-    - define_data (dict): Dictionary containing DFHMDF define data.
 
-    Returns:
-    - str: React code for DFHMDF.
+def detect_repeating_groups(fields):
     """
-    col = int(define_data["pos"][1])
-    row = int(define_data["pos"][0])
-    max_length = f'maxLength={{{int(define_data["length"])}}}'
-    tsx_id = ""
-    tsx_name = ""
-    on_change_function = ""
-    on_keydown_function = ""
-    color = (
-        f'styles={{{{color:"{define_data["color"].lower()}"}}}}'
-        if "color" in define_data
-        else ""
+    Groups fields whose name is <prefix><index> (e.g. CRDSEL1..7, ACCTNO1..7) into
+    table columns, clustering columns that share the exact same set of indexes into
+    one repeating table - this is how a real BMS selection list (CardDemo COCRDLI
+    style) is represented. Returns (tables, remaining_fields).
+    """
+    by_prefix = {}
+    for f in fields:
+        name = f.get("name") or ""
+        m = GROUP_NAME_RE.match(name)
+        if not m:
+            continue
+        prefix, idx = m.group(1), int(m.group(2))
+        by_prefix.setdefault(prefix, []).append((idx, f))
+
+    candidate_prefixes = {p: items for p, items in by_prefix.items() if len(items) >= 2}
+    if not candidate_prefixes:
+        return [], fields
+
+    idxset_to_prefixes = {}
+    for prefix, items in candidate_prefixes.items():
+        idxset = tuple(sorted(idx for idx, _ in items))
+        idxset_to_prefixes.setdefault(idxset, []).append(prefix)
+
+    tables = []
+    consumed_names = set()
+    for idxset, prefixes in idxset_to_prefixes.items():
+        if len(idxset) < 2 or len(prefixes) < 2:
+            continue
+
+        def avg_col(p):
+            items = candidate_prefixes[p]
+            return sum(it.get("col", 0) for _, it in items) / len(items)
+
+        ordered_prefixes = sorted(prefixes, key=avg_col)
+        rows = []
+        for idx in idxset:
+            row_entry = {}
+            for p in ordered_prefixes:
+                match = next((it for i2, it in candidate_prefixes[p] if i2 == idx), None)
+                if match:
+                    row_entry[p] = match
+                    consumed_names.add(match.get("name"))
+            rows.append(row_entry)
+        tables.append({
+            "columns": ordered_prefixes,
+            "columnKind": {p: classify_field(candidate_prefixes[p][0][1]) for p in ordered_prefixes},
+            "rowIndexes": list(idxset),
+            "rows": rows,
+        })
+
+    remaining = [f for f in fields if f.get("name") not in consumed_names]
+    return tables, remaining
+
+
+def build_screen_model(map_items, map_name):
+    """
+    Builds the intermediate model for a position-accurate terminal replica: every
+    surviving field keeps its own real row/col/length/color so the codegen step can
+    place it on a CSS grid cell-for-cell with the original 3270 map. There is no
+    label/helper pairing and no separate header/title extraction - placing every
+    field (label, input, output) at its own real position already reproduces
+    whatever visual relationship it had with its neighbors in the source map, for
+    free. This model is also written out as <MAP>.model.json for inspection.
+    """
+    grid_rows, grid_cols = extract_grid_size(map_items)
+
+    fields = [f for f in map_items if is_field_definition(f)]
+    for f in fields:
+        f["kind"] = classify_field(f)
+
+    visible = [
+        f for f in fields
+        if f["kind"] != "skip" and not (f["kind"] == "label" and is_decorative_initial(f.get("initial")))
+    ]
+
+    function_keys = detect_function_keys([f for f in visible if f["kind"] in ("label", "output")])
+
+    errmsg_field = next((f for f in visible if (f.get("name") or "").upper() == "ERRMSG"), None)
+    infomsg_field = next((f for f in visible if (f.get("name") or "").upper() == "INFOMSG"), None)
+    body_fields = [f for f in visible if f is not errmsg_field and f is not infomsg_field]
+
+    tables, body_fields = detect_repeating_groups(body_fields)
+
+    def field_record(f):
+        return {
+            "name": f.get("name"),
+            "kind": f.get("kind"),
+            "row": f.get("row"),
+            "col": f.get("col"),
+            "length": f.get("length"),
+            "attrb": f.get("attrb", []),
+            "color": f.get("color"),
+            "hilight": f.get("hilight"),
+            "picin": f.get("picin"),
+            "picout": f.get("picout"),
+            "initial": f.get("initial"),
+            "isDark": "DRK" in f.get("attrb", []),
+            "isNumeric": "NUM" in f.get("attrb", []),
+            "autoFocus": "IC" in f.get("attrb", []),
+            "isJustifyRight": "RIGHT" in (f.get("justify") or []),
+            # Only applied to real server-supplied values (kind 'output') - an
+            # input field's PICOUT would describe how the *submitted* value gets
+            # edited by the legacy program, not how to render what the user types.
+            "picFormat": parse_picture_edit(f.get("picout")) if f.get("kind") == "output" else None,
+        }
+
+    return {
+        "mapName": map_name,
+        "gridRows": grid_rows,
+        "gridCols": grid_cols,
+        "fields": [
+            field_record(f)
+            for f in sorted(body_fields, key=lambda x: (x.get("row", 0), x.get("col", 0)))
+        ],
+        "tables": tables,
+        "errmsgField": errmsg_field.get("name") if errmsg_field else None,
+        "errmsgRow": errmsg_field.get("row") if errmsg_field else None,
+        "errmsgCol": errmsg_field.get("col") if errmsg_field else None,
+        "errmsgLength": errmsg_field.get("length") if errmsg_field else None,
+        "infomsgField": infomsg_field.get("name") if infomsg_field else None,
+        "infomsgRow": infomsg_field.get("row") if infomsg_field else None,
+        "infomsgCol": infomsg_field.get("col") if infomsg_field else None,
+        "infomsgLength": infomsg_field.get("length") if infomsg_field else None,
+        "functionKeys": function_keys,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Step 3: codegen - intermediate model -> a single self-contained .tsx file
+# ---------------------------------------------------------------------------
+
+def esc(text):
+    """
+    Escapes text for embedding inside a single-quoted JS string literal, e.g.
+    {'<result>'}. Every piece of literal text parsed from BMS source (labels,
+    static text, button labels) MUST be emitted this way - never as a raw JSX
+    text node - because BMS content routinely contains '{', '}', '<', '>', '&'
+    (ASCII-art banners, box-drawing characters) which JSX would otherwise parse
+    as markup/expression syntax instead of literal text.
+
+    Does NOT trim leading/trailing whitespace: on the position-accurate terminal
+    grid, a field's own INITIAL text is sometimes padded with leading spaces to
+    center or indent it within a LENGTH wider than the visible text - stripping
+    that would silently shift it out of its real position.
+    """
+    return (text or "").replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ")
+
+
+def jsx_text(text):
+    """Wraps literal text as a safe JS string-literal JSX expression: {'...'}"""
+    return "{'" + esc(text) + "'}"
+
+
+def field_var(name):
+    return (name or "field").lower()
+
+
+def grid_style(row, col, length):
+    """Inline style placing one element at its real BMS row/col on the character
+    grid - `gridColumn` spans exactly `length` 1ch-wide track columns, so the
+    rendered width always matches the field's declared LENGTH."""
+    return f"style={{{{ gridRow: {row or 1}, gridColumn: '{col or 1} / span {max(length or 1, 1)}' }}}}"
+
+
+def render_positioned_field(field):
+    """Renders one field (label/output/input) at its exact grid position. A label
+    is static text; an output field is read-only server-supplied text; an input
+    is a real <input> the user can type into - all three are just "a cell on the
+    screen" in a position-accurate replica, so there is no label/input pairing or
+    wrapper markup here, unlike a conventional form layout."""
+    row, col, length = field.get("row"), field.get("col"), field.get("length") or 1
+    style = grid_style(row, col, length)
+    color_class = css_class_for(field)
+
+    if field["kind"] == "input":
+        var = field_var(field["name"])
+        input_type = "password" if field.get("isDark") else "text"
+        extra_props = ['autoComplete="off"']
+        if field.get("isNumeric"):
+            extra_props.append('inputMode="numeric"')
+        if field.get("autoFocus"):
+            extra_props.append("autoFocus")
+        extra = " ".join(extra_props)
+        return f"""<input
+          {style}
+          id="{var}"
+          name="{var}"
+          type="{input_type}"
+          maxLength={{{length}}}
+          {extra}
+          disabled={{isLoading}}
+          value={{formData.{var} ?? ''}}
+          onChange={{(e) => handleInputChange('{var}', e.target.value)}}
+          className="bg-black {color_class} font-mono border-0 border-b border-dotted border-green-900 focus:outline-none focus:border-solid focus:border-cyan-400 disabled:opacity-60"
+        />"""
+
+    text_jsx = jsx_text(field.get("initial") or "")
+    if field["kind"] == "label":
+        return f'<span {style} className="whitespace-pre {color_class}">{text_jsx}</span>'
+    # output - server-supplied, read from receivedData
+    var = field_var(field["name"])
+    pic = field.get("picFormat")
+    value_expr = (
+        f"formatPicOut(receivedData.{var}, {pic['decimals']}, {'true' if pic['sign'] else 'false'})"
+        if pic
+        else f"receivedData.{var} ?? ''"
     )
+    return f'<span {style} className="whitespace-pre {color_class}">{{{value_expr}}}</span>'
 
-    tsx_type = f'type=\'{"number" if "NUM" in define_data.get("attrb", []) else "text"}\''
-    disabled = "disabled" if "PROT" in define_data.get("attrb", []) else ""
 
-    if "name" in define_data:
-        tsx_id = f'name=\'{define_data["name"]}\''.lower()
-        tsx_name = f'id=\'{define_data["name"]}\''.lower()
-        if not disabled and "ASKIP" not in define_data.get("attrb", []):
-            on_change_function = "onChange={handleInputChange}"
-            on_keydown_function = "onKeyDown={handleSubmit}"
-    tag = f"<Input {max_length} {tsx_id} {tsx_name} {tsx_type} {color} {disabled} {on_change_function} {on_keydown_function}/>"
+def render_tables(tables):
+    """A repeating-group list (e.g. CardDemo's COCRDLI card list) still renders as
+    a real HTML table rather than one positioned <span> per cell - the terminal
+    only ever shows a fixed number of visible rows at a time (scrolled via
+    PF7/PF8), so a table is the closer real-world equivalent of the 3270 behavior
+    anyway. It's placed at the grid row just above the table's own first declared
+    data row/column so it still lines up with the rest of the screen, and kept in
+    the same dark/monospace palette as everything else."""
+    if not tables:
+        return ""
+    blocks = []
+    for table in tables:
+        columns = table["columns"]
+        kind = table["columnKind"]
+        first_col_var = field_var(columns[0])
+        start_row = min((cell.get("row", 999) for row in table["rows"] for cell in row.values()), default=1)
+        start_col = min((cell.get("col", 999) for row in table["rows"] for cell in row.values()), default=1)
+        wrapper_style = f"style={{{{ gridRow: '{max(start_row - 1, 1)} / span 20', gridColumn: '{start_col} / -1' }}}}"
+        headers = "".join(
+            "<th className=\"px-2 text-left font-normal text-green-600\">" + jsx_text(col) + "</th>"
+            for col in columns
+        )
+        cells = []
+        for col in columns:
+            var = field_var(col)
+            if kind.get(col) == "input":
+                cells.append(
+                    f"<td className=\"px-2\"><input value={{(formData.{first_col_var}Rows?.[i]?.{var}) ?? ''}} "
+                    f"onChange={{(e) => handleRowChange('{first_col_var}', i, '{var}', e.target.value)}} "
+                    f"disabled={{isLoading}} className=\"bg-black text-green-400 font-mono border-0 border-b border-dotted border-green-900 focus:outline-none disabled:opacity-60\" /></td>"
+                )
+            else:
+                cells.append(f"<td className=\"px-2 font-mono text-green-400 whitespace-pre\">{{row.{var} ?? ''}}</td>")
+        cells_joined = "".join(cells)
+        blocks.append(f"""<div {wrapper_style} className="overflow-x-auto">
+          <table className="text-xs font-mono border-collapse">
+            <thead><tr>{headers}</tr></thead>
+            <tbody>
+              {{(receivedData.{first_col_var}Rows || []).map((row: any, i: number) => (
+                <tr key={{i}}>{cells_joined}</tr>
+              ))}}
+            </tbody>
+          </table>
+        </div>""")
+    return "\n".join(blocks)
 
-    react_code = f"""
-<GridItem col={{{col}}} row={{{row}}}>
-    {tag}
-</GridItem>
+
+def render_alert_region(model):
+    """ERRMSG/INFOMSG keep their own real grid position (every real 3270 map has a
+    dedicated message line) instead of floating as a modern alert card - red/green
+    text in place, matching how the original screen actually reports status.
+
+    errMsg itself is always rendered (falling back to the map's last row when the
+    source has no real ERRMSG field) rather than only when model["errmsgField"]
+    exists: errMsg also carries client-side failures (network errors, etc.) that
+    have nothing to do with a named BMS field, and errMsg must be read somewhere
+    regardless - the `useState` declaring it is unconditional - or an otherwise
+    error-free screen fails `tsc -b` with "declared but never read".
     """
-    return react_code
+    parts = []
+    if model["errmsgField"]:
+        style = grid_style(model["errmsgRow"], model["errmsgCol"], model["errmsgLength"])
+    else:
+        style = grid_style(model["gridRows"], 1, model["gridCols"])
+    parts.append(f'{{errMsg && <span {style} role="alert" className="whitespace-pre text-red-400">{{errMsg}}</span>}}')
+    if model["infomsgField"]:
+        var = field_var(model["infomsgField"])
+        style = grid_style(model["infomsgRow"], model["infomsgCol"], model["infomsgLength"])
+        parts.append(
+            f'{{receivedData.{var} && <span {style} role="status" className="whitespace-pre text-green-400">{{receivedData.{var}}}</span>}}'
+        )
+    return "\n".join(parts)
 
 
-def convert_dfhmdf_label(define_data):
-    """
-    Converts DFHMDF define data to React code.
-
-    Parameters:
-    - define_data (dict): Dictionary containing DFHMDF define data.
-
-    Returns:
-    - str: React code for DFHMDF.
-    """
-    col = int(define_data["pos"][1])
-    row = int(define_data["pos"][0])
-    initial = define_data["initial"] if "initial" in define_data else ""
-    color = (
-        f'style={{{{color:"{define_data["color"].lower()}"}}}}'
-        if "color" in define_data
-        else ""
+def render_function_key_effect(function_keys):
+    if not function_keys:
+        return ""
+    entries = ", ".join(
+        f"{{ key: '{fk['key']}', action: '{fk['action']}' }}" for fk in function_keys
     )
-    occurs = ""
-    current_row = row
-    for index in range(int(define_data.get("occurs", 0))):
-        current_row += 1
-        occurs += f"""
-<GridItem col={{{col}}} row={{{current_row}}}>
-    <label> {f"{{receivedData.{define_data.get('name').lower()} }}" if define_data.get("name") else " "} </label>
-</GridItem>
+    return f"""
+  const FUNCTION_KEYS = [{entries}];
+  useEffect(() => {{
+    const handler = (e: KeyboardEvent) => {{
+      const match = FUNCTION_KEYS.find((fk) => fk.key === e.key);
+      if (match) {{
+        e.preventDefault();
+        submitAction(match.action);
+      }}
+    }};
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }}, [formData]);
 """
 
-    tag = f"<label {color}>"
-    end_tag = "</label>"
-    react_code = f"""
-<GridItem col={{{col}}} row={{{row}}}>
-    {tag}
-         {f"{{receivedData.{define_data.get('name').lower()} }}" if define_data.get("name") else initial} 
-    {end_tag}
-</GridItem>
-{occurs}
-    """
-    return react_code
+
+def build_state_types(model):
+    output_names = set()
+    input_names = set()
+    for f in model["fields"]:
+        if f["kind"] == "output":
+            output_names.add(field_var(f["name"]))
+        elif f["kind"] == "input":
+            input_names.add(field_var(f["name"]))
+    if model["errmsgField"]:
+        output_names.add(field_var(model["errmsgField"]))
+    if model["infomsgField"]:
+        output_names.add(field_var(model["infomsgField"]))
+    for t in model["tables"]:
+        first_col_var = field_var(t["columns"][0])
+        output_names.add(f"{first_col_var}Rows")
+        for col in t["columns"]:
+            if t["columnKind"].get(col) == "input":
+                input_names.add(f"{first_col_var}Rows")
+
+    # A "...Rows" entry (an editable table's rows) is an array of partial row objects
+    # - see handleRowChange's `rows[index] = { ...(rows[index] || {}), [field]: value }`
+    # below - never a plain string like every other formInput field. Typing/initializing
+    # it as `string` made every per-cell `formData.xRows?.[i]?.field` access a real
+    # `tsc -b` error (property access on type 'string').
+    def is_rows_field(n):
+        return n.endswith("Rows")
+
+    input_type = "\n  ".join(
+        f"{n}: {'Record<string, string>[]' if is_rows_field(n) else 'string'};"
+        for n in sorted(input_names)
+    ) or "[key: string]: string;"
+    # Optional: every output field (including errmsgField/infomsgField/table "...Rows"
+    # names) is populated asynchronously from the API response, never in the initial
+    # useState() literal below - declaring them required made every single generated
+    # screen fail `tsc -b` with "missing properties ... errmsg, infomsg" (and more for
+    # screens with tables), since TypeScript correctly rejected the initial object
+    # literal against the (wrongly) required type.
+    output_type = "\n  ".join(f"{n}?: any;" for n in sorted(output_names)) or "[key: string]: any;"
+    input_initial = "\n    ".join(
+        f"{n}: {'[]' if is_rows_field(n) else chr(39) + chr(39)},"
+        for n in sorted(input_names)
+    ) or ""
+    output_initial_parts = []
+    for f in model["fields"]:
+        if f["kind"] == "output":
+            init = esc(f.get("initial") or "")
+            output_initial_parts.append(f"{field_var(f['name'])}: '{init}',")
+    output_initial = "\n    ".join(output_initial_parts)
+    return input_type, output_type, input_initial, output_initial
 
 
-def convert_dfhmdf(define_data):
-    """
-    Converts DFHMDF define data to React code.
+def build_component(model):
+    map_name = model["mapName"]
+    grid_rows, grid_cols = model["gridRows"], model["gridCols"]
+    fields_jsx = "\n          ".join(render_positioned_field(f) for f in model["fields"])
+    tables_jsx = render_tables(model["tables"])
+    alert_jsx = render_alert_region(model)
+    key_effect = render_function_key_effect(model["functionKeys"])
+    input_type, output_type, input_initial, output_initial = build_state_types(model)
 
-    Parameters:
-    - define_data (dict): Dictionary containing DFHMDF define data.
+    # Generating these unconditionally produced a real `tsc -b` error
+    # ("'handleInputChange'/'handleRowChange' is declared but its value is never
+    # read") on every screen with no plain input field (e.g. COPAU01, entirely
+    # view-only) or no editable table column (e.g. COACTVW's read-only ACSADL
+    # table) - noUnusedLocals correctly flags a function nothing calls.
+    has_plain_inputs = any(f["kind"] == "input" for f in model["fields"])
+    has_editable_tables = any(
+        t["columnKind"].get(col) == "input" for t in model["tables"] for col in t["columns"]
+    )
+    needs_pic_format = any(f.get("picFormat") for f in model["fields"])
+    pic_format_fn = (
+        """
+// Formats a numeric display value the way the original BMS PICOUT edit mask
+// would (e.g. PICOUT='+ZZZ,ZZZ,ZZZ.99' -> 2 decimals, floating sign): comma
+// grouping, fixed decimal places, and an explicit +/- sign when the mask has one.
+function formatPicOut(raw: unknown, decimals: number, sign: boolean): string {
+  const n = Number(raw);
+  if (raw === undefined || raw === null || raw === '' || Number.isNaN(n)) return String(raw ?? '');
+  const abs = Math.abs(n).toFixed(decimals);
+  const [intPart, decPart] = abs.split('.');
+  const grouped = intPart.replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',');
+  const signStr = sign ? (n < 0 ? '-' : '+') : '';
+  return decPart ? `${signStr}${grouped}.${decPart}` : `${signStr}${grouped}`;
+}
+"""
+        if needs_pic_format
+        else ""
+    )
 
-    Returns:
-    - str: React code for DFHMDF.
-    """
-    if ("attrb" in define_data and "UNPROT" in define_data["attrb"]) or (
-        "attrb" in define_data and "IC" in define_data["attrb"]
-    ):
-        return convert_dfhmdf_input(define_data)
-    elif (
-        "initial" in define_data
-        or ("attrb" in define_data and "PROT" in define_data["attrb"])
-        or ("attrb" in define_data and "ASKIP" in define_data["attrb"])
-    ):
-        return convert_dfhmdf_label(define_data)
-    else:
-        return convert_dfhmdf_input(define_data)
+    input_change_fn = ""
+    if has_plain_inputs:
+        input_change_fn = """
+  const handleInputChange = (name: string, value: string) => {
+    setFormData((prev: any) => ({ ...prev, [name]: value }));
+  };
+"""
 
+    # setFormData is called by handleInputChange and/or handleRowChange - if neither
+    # exists (a fully view-only screen like COPAU01), destructuring it anyway is
+    # another "declared but never read" tsc error.
+    form_data_destructure = (
+        "formData, setFormData" if (has_plain_inputs or has_editable_tables) else "formData"
+    )
 
-def convert_react_items(map_items):
-    """
-    Converts a list of map items to React code.
+    row_change_fn = ""
+    if has_editable_tables:
+        row_change_fn = """
+  const handleRowChange = (tableKey: string, index: number, field: string, value: string) => {
+    setFormData((prev: any) => {
+      const rows = [...(prev[`${tableKey}Rows`] || [])];
+      rows[index] = { ...(rows[index] || {}), [field]: value };
+      return { ...prev, [`${tableKey}Rows`]: rows };
+    });
+  };
+"""
 
-    Parameters:
-    - map_items (list): List of dictionaries containing map items.
-
-    Returns:
-    - list: List of React code strings.
-    """
-    react_items = []
-    for map_item in map_items:
-        if "define" in map_item:
-            define_data = map_item["define"]
-            converted_item = ""
-            if define_data == "DFHMSD":
-                converted_item = convert_dfhmsd(map_item)
-            elif define_data == "DFHMDI":
-                converted_item = convert_dfhmdi(map_item)
-            elif define_data == "DFHMDF":
-                converted_item = convert_dfhmdf(map_item)
-            else:
-                converted_item = f"Unsupported define: {define_data}"
-            react_items.append(converted_item)
-    return react_items
-
-
-def combine_rsx_code(react_items, component_name, component_data):
-    """
-    Combines React code items into a complete React component.
-
-    Parameters:
-    - react_items (list): List of React code items.
-    - component_name (str): Name of the React component.
-
-    Returns:
-    - str: Complete React component code.
-    """
-    react_items = "".join(react_items)
-    react_component = f"""
-import {{ type ChangeEvent, useState, type KeyboardEvent }} from 'react';
-import {{ Helmet }} from 'react-helmet';
+    return f"""import {{ useEffect, useState }} from 'react';
+import {{ useNavigate }} from 'react-router-dom';
 import axios from 'axios';
-import httpConfig from '../../config/httpConfig';
+{pic_format_fn}
+type formInput = {{
+  {input_type}
+}}
 
-import {{ GridItem }} from '../../components/GridSystem';
-import Input from '../../components/Input';
+type formOutput = {{
+  {output_type}
+}}
 
-export default function {component_name}() {{
-    {component_data}
+export function {map_name}() {{
+  const navigate = useNavigate();
+  const [{form_data_destructure}] = useState<formInput>({{
+    {input_initial}
+  }});
+  const [receivedData, setReceivedData] = useState<formOutput>({{
+    {output_initial}
+  }});
+  const [errMsg, setErrMsg] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+
+{input_change_fn}{row_change_fn}
+  const submitAction = async (action: string) => {{
+    setIsLoading(true);
+    setErrMsg('');
+    try {{
+      const baseUrl = (import.meta as any).env?.VITE_API_BASE_URL || '';
+      const response = await axios.post(`${{baseUrl}}/api/{map_name}`, {{ action, fields: formData }});
+      const data = response.data as {{ fields?: Partial<formOutput>; errmsg?: string; nextScreen?: string }};
+      if (data.fields) {{
+        setReceivedData((prev) => ({{ ...prev, ...data.fields }}));
+      }}
+      if (data.errmsg) {{
+        setErrMsg(data.errmsg);
+      }}
+      if (data.nextScreen) {{
+        navigate(`/${{data.nextScreen}}`);
+      }}
+    }} catch (err) {{
+      setErrMsg(err instanceof Error ? err.message : 'Request failed');
+    }} finally {{
+      setIsLoading(false);
+    }}
+  }};
+{key_effect}
   return (
-    <>
-     {react_items}
-    </>
+    <div className="min-h-screen bg-black flex items-start justify-center p-4">
+      <div
+        className="relative bg-black text-green-400 font-mono text-[13px] leading-[1.35] p-3 border border-green-900 rounded shadow-[0_0_25px_rgba(34,197,94,0.12)] overflow-x-auto"
+        style={{{{
+          display: 'grid',
+          gridTemplateColumns: 'repeat({grid_cols}, 1ch)',
+          gridTemplateRows: 'repeat({grid_rows}, 1.35em)',
+          width: 'max-content',
+          minWidth: '100%',
+        }}}}
+      >
+          {fields_jsx}
+          {tables_jsx}
+          {alert_jsx}
+          {{isLoading && (
+            <span style={{{{ gridRow: {grid_rows}, gridColumn: '{max(grid_cols - 9, 1)} / span 9' }}}} className="text-yellow-300 animate-pulse">{{'...WAIT...'}}</span>
+          )}}
+      </div>
+    </div>
   );
 }}
-    """.replace(
-        "<title>Untitle</title>", f"<title>{component_name}</title>"
-    )
-    return react_component
+
+export default {map_name};
+"""
 
 
-def get_all_field_name(map_items):
-    """
-    Extracts and filters BMS map item fields.
-
-    Parameters:
-    - map_items (list of dict): List of dictionaries representing BMS map items.
-
-    Returns:
-    - list of dict: Filtered list of BMS map item fields.
-    """
-    filtered_list = [
-        {
-            "name": item.get("name", ""),
-            "type": f'{"number" if "NUM" in item.get("attrb", []) else "text"}',
-            "jtype": f'{"Integer" if "NUM" in item.get("attrb", []) else "String"}',
-            **item,
-        }
-        for item in map_items
-        if (("attrb" in item)
-        and "initial" not in item
-        and (
-            item["attrb"]
-            and "PROT" not in item["attrb"]
-            and "ASKIP" not in item["attrb"]
-        )
-        and ("name" in item and item["name"]))
-        or (("attrb" in item and "UNPROT" in item["attrb"]) or (
-        "attrb" in item and "IC" in item["attrb"]))
-    ]
-    return filtered_list
-
-
-def get_all_output_field_name(map_items):
-    """
-    Extracts and filters unique output fields from BMS map items.
-
-    Parameters:
-    - map_items (list of dict): List of dictionaries representing BMS map items.
-
-    Returns:
-    - list of dict: Filtered list of unique output fields.
-    """
-    list_input = get_all_field_name(map_items)
-    exclude_values = set(item["name"] for item in list_input)
-    filtered_list = [
-        {
-            "name": item.get("name", ""),
-            "type": f'{"number" if "NUM" in item.get("attrb", []) else "text"}',
-            "jtype": f'{"Integer" if "NUM" in item.get("attrb", []) else "String"}',
-            **item,
-        }
-        for item in map_items
-        if ("name" in item and item["name"]) and item.get("name") not in exclude_values
-    ]
-    unique_names = set()
-    unique_list_of_dicts = [
-        d
-        for d in filtered_list
-        if d["name"] not in unique_names and not unique_names.add(d["name"])
-    ]
-    return unique_list_of_dicts
-
-
-def extract_type_data(map_items, file_name):
-    """
-    Extracts type data for React code generation.
-
-    Parameters:
-    - map_items (list): List of dictionaries containing map items.
-    - file_name (str): Name of the React component.
-
-    Returns:
-    - str: React type and data extraction code.
-    """
-    input_fields = get_all_field_name(map_items)
-    output_fields = get_all_output_field_name(map_items)
-
-    react_type_input = ""
-    for item in input_fields:
-        react_type_input += f"{item['name'].lower()}: string,\n"
-    react_type_output = ""
-    for item in output_fields:
-        react_type_output += f"{item['name'].lower()}: string,\n"
-
-    react_type_input_initial = react_type_input.replace("string,", repr("") + ",")
-    react_type_output_initial = ""
-    for item in output_fields:
-        react_type_output_initial += f"{item['name'].lower()}: { repr(item.get('initial')) if item.get('initial') else repr('')},\n"
-
-    handle_data = f"""{""}
-    const [formData, setFormData] = useState<formInput>(
-    {{
-        {react_type_input_initial}
-    }});
-    const [receivedData, setReceivedData] = useState<formOutput>(
-     {{
-        {react_type_output_initial}
-    }});
-
-    const handleInputChange = (event: ChangeEvent<HTMLInputElement>) => {{
-    setFormData((state) => {{
-        return {{
-        ...state,
-        [event.target.name]: event.target.value,
-        }};
-    }});
-    }};
-
-    const handleSubmit = async (event: KeyboardEvent<HTMLInputElement>) => {{
-    if (event.key === 'Enter') {{
-        for (const key in formData) {{
-        if (!formData[key]) {{
-            return;
-        }}
-        }}
-
-        const response = await axios.post(
-        httpConfig.domain + '/{file_name.capitalize()}',
-        formData
-        );
-
-        setReceivedData(_state => response.data);
-    }}
-    }};
-    """
-
-    react_type_input = ""
-    for item in input_fields:
-        react_type_input += f"{item['name'].lower()}: string,\n"
-    react_type_output = ""
-    for item in output_fields:
-        react_type_output += f"{item['name'].lower()}: string,\n"
-    react_code = f"""
-    type formInput = {{
-        {react_type_input}
-    }}
-
-    type formOutput = {{
-        {react_type_output}
-    }}
-    """
-    return react_code + handle_data
-
+# ---------------------------------------------------------------------------
+# Orchestration (per-file processing, router export, CLI) - unchanged shape,
+# now driven by build_screen_model()/build_component() instead of the old
+# per-item GridItem codegen.
+# ---------------------------------------------------------------------------
 
 def parse_bms_2_tsx(bms_file, tsx_file):
     """
-    Parses a BMS file and generates a corresponding TSX file.
+    Parses a BMS file and generates a corresponding TSX file (plus a sibling
+    <MAP>.model.json with the intermediate model, for inspection).
 
     Parameters:
     - bms_file (str): Path to the BMS file.
     - tsx_file (str): Path to the output TSX file.
 
     Returns:
-    - dict or None: Extracted information from the BMS file.
+    - dict or None: {"name": <component name>} on success, None on failure.
     """
     desired_object = {}
     try:
         map_items = extract_map_items(bms_file)
-        react_items = convert_react_items(map_items)
-        # desired_object = next(
-        #     (
-        #         obj
-        #         for obj in map_items
-        #         if obj.get("define") == "DFHMSD" and "name" in obj
-        #     ),
-        #     {"name": "DefaultComponent"},
-        # )
-        desired_object = {
-            "name": bms_file.replace(os.path.abspath(os.path.dirname(bms_file)), "")
-            .replace(".bms", "")
-            .replace("/", "")
-            .replace("\\", "")
-        }
-        rsx_file_content = combine_rsx_code(
-            react_items,
-            desired_object["name"],
-            extract_type_data(map_items, desired_object["name"]),
-        )
-        with open(f"{tsx_file}", "w", encoding="utf8") as file:
-            file.write(rsx_file_content)
-        file.close()
+        # Just the filename, extension stripped - e.g. "/abs/dir/COACTUP.bms" ->
+        # "COACTUP". The previous approach (stripping os.path.abspath(dirname(bms_file))
+        # out of bms_file itself) silently broke whenever bms_file was passed as a
+        # relative path: abspath() always returns an absolute string, which then never
+        # matches inside the original relative bms_file, so nothing got stripped and the
+        # whole path (with slashes removed) leaked into the component name instead
+        # (e.g. "._verify_inCOACTUP"). The real backend adapter always resolves an
+        # absolute sourceDir before invoking this CLI, so production was never affected -
+        # but direct/manual CLI invocations with a relative path were.
+        map_name = os.path.splitext(os.path.basename(bms_file))[0]
+        model = build_screen_model(map_items, map_name)
+        tsx_content = build_component(model)
+        with open(tsx_file, "w", encoding="utf8") as file:
+            file.write(tsx_content)
+        model_file = os.path.splitext(tsx_file)[0] + ".model.json"
+        with open(model_file, "w", encoding="utf8") as file:
+            json.dump(model, file, indent=2)
+        desired_object = {"name": map_name}
     except Exception as ex:
         print(ex)
         return None
@@ -603,7 +1032,7 @@ def export_react_router(dfhmsd, tsx_directory):
         react_export = []
         for item in dfhmsd:
             react_export.append({"name": item["name"], "component": f'{item["name"]}'})
-            react_import.append(f'import {item["name"]} from "./{item["name"]}"')
+            react_import.append(f'import {{ {item["name"]} }} from "./{item["name"]}"')
         output_str = json.dumps(react_export, separators=(",", ":"))
         react_import = "\n".join(react_import)
         react_code = f"""
