@@ -16,6 +16,7 @@ from bms2react import (
     detect_repeating_groups,
     normalize_continued_text,
     extract_property,
+    parse_picture_edit,
 )
 
 
@@ -212,6 +213,21 @@ class BuildStateTypesTests(unittest.TestCase):
         }
         _, output_type, _, _ = build_state_types(model)
         self.assertIn("crdselRows?: any;", output_type)
+
+
+class ParsePictureEditTests(unittest.TestCase):
+    def test_parses_the_real_coactvw_money_mask(self):
+        # Verbatim from CardDemo COACTVW.bms (ACRDLIM/ACSHLIM/ACURBAL/ACRCYCR/ACRCYDB).
+        self.assertEqual(parse_picture_edit("+ZZZ,ZZZ,ZZZ.99"), {"sign": True, "decimals": 2})
+
+    def test_plain_digit_count_picin_is_not_a_display_format(self):
+        # Verbatim from CardDemo COACTVW.bms (ACCTSID) - an input length constraint,
+        # not an edit mask, so there is nothing to format for display.
+        self.assertIsNone(parse_picture_edit("99999999999"))
+
+    def test_no_mask_returns_none(self):
+        self.assertIsNone(parse_picture_edit(None))
+        self.assertIsNone(parse_picture_edit(""))
 
 
 if __name__ == "__main__":

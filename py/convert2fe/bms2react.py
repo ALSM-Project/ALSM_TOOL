@@ -195,6 +195,7 @@ def extract_property(current_item):
     pattern_hilight = re.compile(r"HILIGHT\s*=\s*([A-Z]+)")
     pattern_picin = re.compile(r"PICIN\s*=\s*'([^']*)'")
     pattern_picout = re.compile(r"PICOUT\s*=\s*'([^']*)'")
+    pattern_justify = re.compile(r"JUSTIFY\s*=\s*\(([^)]*)\)")
     pattern_occurs = re.compile(r"OCCURS\s*=\s*([0-9]+)")
     pattern_mapatts = re.compile(r"MAPATTS\s*=\s*(?:\(([A-Z,]+)\)|([A-Z]+))")
     pattern_attrb = re.compile(r"ATTRB\s*=\s*(?:\(([A-Z,]+)\)|([A-Z]+))")
@@ -264,6 +265,8 @@ def extract_property(current_item):
         data["picin"] = pattern_picin.search(current_item).group(1)
     if pattern_picout.search(current_item):
         data["picout"] = pattern_picout.search(current_item).group(1)
+    if pattern_justify.search(current_item):
+        data["justify"] = [v.strip() for v in pattern_justify.search(current_item).group(1).split(",") if v.strip()]
     if pattern_mapatts.search(current_item):
         search = pattern_mapatts.search(current_item).group(0)
         data["mapatts"] = get_value(search)
@@ -367,7 +370,8 @@ def classify_field(field):
 
 
 def css_class_for(field):
-    """3270 COLOR/HILIGHT/BRT -> semantic Tailwind classes (never a raw color name)."""
+    """3270 COLOR/HILIGHT/BRT/JUSTIFY -> semantic Tailwind classes (never a raw color
+    name)."""
     color = (field.get("color") or "DEFAULT").upper()
     classes = [COLOR_TOKEN_MAP.get(color, COLOR_TOKEN_MAP["DEFAULT"])]
     attrb = field.get("attrb", [])
@@ -376,7 +380,31 @@ def css_class_for(field):
     hilight = (field.get("hilight") or "").upper()
     if hilight and hilight != "OFF":
         classes.append(HILIGHT_TOKEN_MAP.get(hilight, ""))
+    if field.get("isJustifyRight"):
+        classes.append("text-right")
     return " ".join(c for c in classes if c).strip()
+
+
+def parse_picture_edit(mask):
+    """
+    Parses the handful of COBOL numeric-edit symbols actually present in this
+    project's real BMS source (e.g. PICOUT='+ZZZ,ZZZ,ZZZ.99') into what's needed to
+    format a value the same way at render time: how many decimal places, and
+    whether there's a floating +/- sign. Returns None for anything that isn't a
+    recognizable numeric edit mask (e.g. a plain PICIN digit-count string with no
+    '.', '+', '-', or 'Z', which is just an input length constraint, not a display
+    format).
+    """
+    if not mask:
+        return None
+    has_sign = mask[0] in ("+", "-")
+    has_edit_symbol = any(c in mask for c in "Z.,")
+    if not has_sign and not has_edit_symbol:
+        return None
+    decimals = 0
+    if "." in mask:
+        decimals = sum(1 for c in mask.rsplit(".", 1)[1] if c in "9Z0")
+    return {"sign": has_sign, "decimals": decimals}
 
 
 def is_decorative_initial(text):
@@ -522,6 +550,11 @@ def build_screen_model(map_items, map_name):
             "isDark": "DRK" in f.get("attrb", []),
             "isNumeric": "NUM" in f.get("attrb", []),
             "autoFocus": "IC" in f.get("attrb", []),
+            "isJustifyRight": "RIGHT" in (f.get("justify") or []),
+            # Only applied to real server-supplied values (kind 'output') - an
+            # input field's PICOUT would describe how the *submitted* value gets
+            # edited by the legacy program, not how to render what the user types.
+            "picFormat": parse_picture_edit(f.get("picout")) if f.get("kind") == "output" else None,
         }
 
     return {
@@ -619,7 +652,13 @@ def render_positioned_field(field):
         return f'<span {style} className="whitespace-pre {color_class}">{text_jsx}</span>'
     # output - server-supplied, read from receivedData
     var = field_var(field["name"])
-    return f'<span {style} className="whitespace-pre {color_class}">{{receivedData.{var} ?? \'\'}}</span>'
+    pic = field.get("picFormat")
+    value_expr = (
+        f"formatPicOut(receivedData.{var}, {pic['decimals']}, {'true' if pic['sign'] else 'false'})"
+        if pic
+        else f"receivedData.{var} ?? ''"
+    )
+    return f'<span {style} className="whitespace-pre {color_class}">{{{value_expr}}}</span>'
 
 
 def render_tables(tables):
@@ -787,6 +826,25 @@ def build_component(model):
     has_editable_tables = any(
         t["columnKind"].get(col) == "input" for t in model["tables"] for col in t["columns"]
     )
+    needs_pic_format = any(f.get("picFormat") for f in model["fields"])
+    pic_format_fn = (
+        """
+// Formats a numeric display value the way the original BMS PICOUT edit mask
+// would (e.g. PICOUT='+ZZZ,ZZZ,ZZZ.99' -> 2 decimals, floating sign): comma
+// grouping, fixed decimal places, and an explicit +/- sign when the mask has one.
+function formatPicOut(raw: unknown, decimals: number, sign: boolean): string {
+  const n = Number(raw);
+  if (raw === undefined || raw === null || raw === '' || Number.isNaN(n)) return String(raw ?? '');
+  const abs = Math.abs(n).toFixed(decimals);
+  const [intPart, decPart] = abs.split('.');
+  const grouped = intPart.replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',');
+  const signStr = sign ? (n < 0 ? '-' : '+') : '';
+  return decPart ? `${signStr}${grouped}.${decPart}` : `${signStr}${grouped}`;
+}
+"""
+        if needs_pic_format
+        else ""
+    )
 
     input_change_fn = ""
     if has_plain_inputs:
@@ -818,7 +876,7 @@ def build_component(model):
     return f"""import {{ useEffect, useState }} from 'react';
 import {{ useNavigate }} from 'react-router-dom';
 import axios from 'axios';
-
+{pic_format_fn}
 type formInput = {{
   {input_type}
 }}
