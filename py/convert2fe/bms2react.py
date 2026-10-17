@@ -56,9 +56,16 @@ HILIGHT_TOKEN_MAP = {
     'REVERSE': 'font-semibold',
 }
 
-# Real function-key legend line, e.g. "ENTER=Sign-on  F3=Exit  F7=Backward F8=Forward"
+# Real function-key legend line, e.g. "ENTER=Sign-on  F3=Exit  F7=Backward F8=Forward".
+# Real CardDemo maps use either convention - COPAU01 double-spaces between keys, but
+# COACTUP's FKEYS field (LENGTH=21, no room to spare) single-spaces them
+# ('ENTER=Process F3=Exit') - requiring 2+ spaces silently dropped the first key on
+# every tightly-packed field. The lookahead already disambiguates "is the next token
+# a real key=value pair" independently of how much whitespace precedes it (so a
+# multi-word label like "Mark/Remove Fraud" still isn't split early), so 1+ spaces
+# is both necessary and sufficient.
 FUNCTION_KEY_LEGEND_RE = re.compile(
-    r'(ENTER|PF\d{1,2}|F\d{1,2})\s*=\s*([^=]*?)(?=\s{2,}(?:ENTER|PF\d{1,2}|F\d{1,2})\s*=|$)',
+    r'(ENTER|PF\d{1,2}|F\d{1,2})\s*=\s*([^=]*?)(?=\s+(?:ENTER|PF\d{1,2}|F\d{1,2})\s*=|$)',
     re.IGNORECASE,
 )
 
@@ -381,26 +388,39 @@ def find_right_helper(field, labels_by_row, used_label_ids):
     return min(candidates, key=lambda f: f.get("col", 0))
 
 
-def detect_function_keys(label_fields, used_label_ids):
+def detect_function_keys(candidate_fields, used_label_ids):
     """
     Finds the function-key legend line (e.g. "ENTER=Sign-on  F3=Exit") among the
-    static-text fields and returns the parsed [{key, label}] list. The matched
-    field is marked as used so it is not also rendered as plain static text.
+    candidate fields and returns the parsed [{key, label}] list. The matched
+    field is marked as used so it is not also rendered a second time.
+
+    The legend is usually unnamed static text (kind 'label'), but some BMS maps
+    (e.g. CardDemo's COACTUP/COCRDSL/COCRDUP/COTRTUP) instead give this same text
+    to a NAMED, protected field (e.g. "FKEYS") so the program can swap it at
+    runtime - classify_field() correctly calls that 'output', not 'label', per
+    real BMS semantics. Scanning only 'label' fields silently dropped the legend
+    - and with it every button/keyboard handler - on exactly those screens.
+    candidate_fields must include both kinds so this is found either way.
+
+    Some maps (e.g. CardDemo's COTRTLI) go further and split the legend across
+    several separate single-key fields (BUTNF02="F2=Add", BUTNF03="F3=Exit", ...)
+    instead of one combined line. Every matching field is scanned and merged into
+    one list (in field order) rather than stopping at the first match, so none of
+    these per-key fields are silently dropped either.
     """
-    for field in label_fields:
+    keys = []
+    for field in candidate_fields:
         text = field.get("initial") or ""
         matches = list(FUNCTION_KEY_LEGEND_RE.finditer(text))
         if len(matches) >= 1 and "=" in text:
             used_label_ids.add(id(field))
-            keys = []
             for m in matches:
                 raw_key = m.group(1).upper()
                 label = m.group(2).strip()
                 js_key = PF_KEY_TO_JS_KEY.get(raw_key, raw_key)
                 action = "ENTER" if raw_key == "ENTER" else re.sub(r"^F", "PF", raw_key)
                 keys.append({"key": js_key, "action": action, "label": label or action})
-            return keys
-    return []
+    return keys
 
 
 def detect_repeating_groups(fields):
@@ -477,10 +497,12 @@ def build_screen_model(map_items, map_name):
 
     used_label_ids = set()
     function_keys = detect_function_keys(
-        [f for f in fields if f["kind"] == "label"], used_label_ids
+        [f for f in fields if f["kind"] in ("label", "output")], used_label_ids
     )
 
-    interactive = [f for f in fields if f["kind"] in ("input", "output")]
+    interactive = [
+        f for f in fields if f["kind"] in ("input", "output") and id(f) not in used_label_ids
+    ]
     for f in interactive:
         left = find_left_label(f, labels_by_row, used_label_ids)
         if left:
@@ -845,9 +867,29 @@ def build_state_types(model):
             if t["columnKind"].get(col) == "input":
                 input_names.add(f"{first_col_var}Rows")
 
-    input_type = "\n  ".join(f"{n}: string;" for n in sorted(input_names)) or "[key: string]: string;"
-    output_type = "\n  ".join(f"{n}: any;" for n in sorted(output_names)) or "[key: string]: any;"
-    input_initial = "\n    ".join(f"{n}: '',".rstrip(',') + "," for n in sorted(input_names)) or ""
+    # A "...Rows" entry (an editable table's rows) is an array of partial row objects
+    # - see handleRowChange's `rows[index] = { ...(rows[index] || {}), [field]: value }`
+    # below - never a plain string like every other formInput field. Typing/initializing
+    # it as `string` made every per-cell `formData.xRows?.[i]?.field` access a real
+    # `tsc -b` error (property access on type 'string').
+    def is_rows_field(n):
+        return n.endswith("Rows")
+
+    input_type = "\n  ".join(
+        f"{n}: {'Record<string, string>[]' if is_rows_field(n) else 'string'};"
+        for n in sorted(input_names)
+    ) or "[key: string]: string;"
+    # Optional: every output field (including errmsgField/infomsgField/table "...Rows"
+    # names) is populated asynchronously from the API response, never in the initial
+    # useState() literal below - declaring them required made every single generated
+    # screen fail `tsc -b` with "missing properties ... errmsg, infomsg" (and more for
+    # screens with tables), since TypeScript correctly rejected the initial object
+    # literal against the (wrongly) required type.
+    output_type = "\n  ".join(f"{n}?: any;" for n in sorted(output_names)) or "[key: string]: any;"
+    input_initial = "\n    ".join(
+        f"{n}: {'[]' if is_rows_field(n) else chr(39) + chr(39)},"
+        for n in sorted(input_names)
+    ) or ""
     output_initial_parts = []
     for f in model["fields"]:
         if f["kind"] == "output":
@@ -874,9 +916,33 @@ def build_component(model):
     key_effect = render_function_key_effect(model["functionKeys"])
     input_type, output_type, input_initial, output_initial = build_state_types(model)
 
-    has_row_tables = bool(model["tables"])
+    # Generating these unconditionally produced a real `tsc -b` error
+    # ("'handleInputChange'/'handleRowChange' is declared but its value is never
+    # read") on every screen with no plain input field (e.g. COPAU01, entirely
+    # view-only) or no editable table column (e.g. COACTVW's read-only ACSADL
+    # table) - noUnusedLocals correctly flags a function nothing calls.
+    has_plain_inputs = any(f["kind"] == "input" for f in model["fields"])
+    has_editable_tables = any(
+        t["columnKind"].get(col) == "input" for t in model["tables"] for col in t["columns"]
+    )
+
+    input_change_fn = ""
+    if has_plain_inputs:
+        input_change_fn = """
+  const handleInputChange = (name: string, value: string) => {
+    setFormData((prev: any) => ({ ...prev, [name]: value }));
+  };
+"""
+
+    # setFormData is called by handleInputChange and/or handleRowChange - if neither
+    # exists (a fully view-only screen like COPAU01), destructuring it anyway is
+    # another "declared but never read" tsc error.
+    form_data_destructure = (
+        "formData, setFormData" if (has_plain_inputs or has_editable_tables) else "formData"
+    )
+
     row_change_fn = ""
-    if has_row_tables:
+    if has_editable_tables:
         row_change_fn = """
   const handleRowChange = (tableKey: string, index: number, field: string, value: string) => {
     setFormData((prev: any) => {
@@ -901,7 +967,7 @@ type formOutput = {{
 
 export function {map_name}() {{
   const navigate = useNavigate();
-  const [formData, setFormData] = useState<formInput>({{
+  const [{form_data_destructure}] = useState<formInput>({{
     {input_initial}
   }});
   const [receivedData, setReceivedData] = useState<formOutput>({{
@@ -910,10 +976,7 @@ export function {map_name}() {{
   const [errMsg, setErrMsg] = useState('');
   const [isLoading, setIsLoading] = useState(false);
 
-  const handleInputChange = (name: string, value: string) => {{
-    setFormData((prev: any) => ({{ ...prev, [name]: value }}));
-  }};
-{row_change_fn}
+{input_change_fn}{row_change_fn}
   const submitAction = async (action: string) => {{
     setIsLoading(true);
     setErrMsg('');
@@ -977,12 +1040,16 @@ def parse_bms_2_tsx(bms_file, tsx_file):
     desired_object = {}
     try:
         map_items = extract_map_items(bms_file)
-        map_name = (
-            bms_file.replace(os.path.abspath(os.path.dirname(bms_file)), "")
-            .replace(".bms", "")
-            .replace("/", "")
-            .replace("\\", "")
-        )
+        # Just the filename, extension stripped - e.g. "/abs/dir/COACTUP.bms" ->
+        # "COACTUP". The previous approach (stripping os.path.abspath(dirname(bms_file))
+        # out of bms_file itself) silently broke whenever bms_file was passed as a
+        # relative path: abspath() always returns an absolute string, which then never
+        # matches inside the original relative bms_file, so nothing got stripped and the
+        # whole path (with slashes removed) leaked into the component name instead
+        # (e.g. "._verify_inCOACTUP"). The real backend adapter always resolves an
+        # absolute sourceDir before invoking this CLI, so production was never affected -
+        # but direct/manual CLI invocations with a relative path were.
+        map_name = os.path.splitext(os.path.basename(bms_file))[0]
         model = build_screen_model(map_items, map_name)
         tsx_content = build_component(model)
         with open(tsx_file, "w", encoding="utf8") as file:

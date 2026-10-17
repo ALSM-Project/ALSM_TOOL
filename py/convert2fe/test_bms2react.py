@@ -10,6 +10,7 @@ Run: python -m unittest test_bms2react -v
 import unittest
 
 from bms2react import (
+    build_state_types,
     classify_field,
     detect_function_keys,
     detect_repeating_groups,
@@ -94,6 +95,43 @@ class DetectFunctionKeysTests(unittest.TestCase):
         label_fields = [{"initial": "Just some regular instructional text"}]
         self.assertEqual(detect_function_keys(label_fields, set()), [])
 
+    def test_finds_the_legend_in_a_named_output_field_not_just_unnamed_labels(self):
+        # Real CardDemo bug (COACTUP/COCRDSL/COCRDUP/COTRTUP): the legend text is
+        # the INITIAL value of a NAMED, protected field (e.g. "FKEYS") - that field
+        # is classified 'output', not 'label', so a caller must include 'output'
+        # fields in candidate_fields or the legend (and every button it implies)
+        # is silently dropped.
+        candidate_fields = [
+            {"name": "FKEYS", "kind": "output", "initial": "ENTER=Process F3=Exit"},
+        ]
+        used = set()
+        keys = detect_function_keys(candidate_fields, used)
+        self.assertEqual(
+            keys,
+            [
+                {"key": "Enter", "action": "ENTER", "label": "Process"},
+                {"key": "F3", "action": "PF3", "label": "Exit"},
+            ],
+        )
+        self.assertEqual(len(used), 1)
+
+    def test_merges_keys_split_across_several_single_key_fields(self):
+        # Real CardDemo bug (COTRTLI): instead of one combined legend line, each
+        # key gets its own named field (BUTNF02="F2=Add", BUTNF03="F3=Exit", ...).
+        # Every matching field must contribute to one merged, ordered list rather
+        # than only the first one found.
+        candidate_fields = [
+            {"name": "BUTNF02", "kind": "output", "initial": "F2=Add"},
+            {"name": "BUTNF03", "kind": "output", "initial": "F3=Exit"},
+            {"name": "BUTNF07", "kind": "output", "initial": "F7=Page Up"},
+            {"name": "BUTNF08", "kind": "output", "initial": "F8=Page Dn"},
+            {"name": "BUTNF10", "kind": "output", "initial": "F10=Save"},
+        ]
+        used = set()
+        keys = detect_function_keys(candidate_fields, used)
+        self.assertEqual([k["key"] for k in keys], ["F2", "F3", "F7", "F8", "F10"])
+        self.assertEqual(len(used), 5)
+
 
 class DetectRepeatingGroupsTests(unittest.TestCase):
     def test_groups_same_indexed_columns_into_one_table(self):
@@ -146,6 +184,40 @@ class ExtractPropertyTests(unittest.TestCase):
         raw = "TESTFLD DFHMDF ATTRB=PROT,LENGTH=1,POS=(1,1)"
         data = extract_property(raw)
         self.assertEqual(data["attrb"], ["PROT"])
+
+
+class BuildStateTypesTests(unittest.TestCase):
+    def test_errmsg_and_infomsg_are_optional_since_the_initial_literal_never_sets_them(self):
+        # Real bug: every generated screen declares `errmsg`/`infomsg` as REQUIRED
+        # formOutput fields but never includes them in the initial useState()
+        # literal (they only ever arrive later from the API response) - this made
+        # `tsc -b` fail on every single converted screen with "missing properties
+        # ... errmsg, infomsg" the moment a real project scaffold tried to build it.
+        model = {
+            "titles": [],
+            "metadata": [],
+            "fields": [],
+            "errmsgField": "ERRMSG",
+            "infomsgField": "INFOMSG",
+            "tables": [],
+        }
+        _, output_type, _, output_initial = build_state_types(model)
+        self.assertIn("errmsg?: any;", output_type)
+        self.assertIn("infomsg?: any;", output_type)
+        self.assertNotIn("errmsg:", output_initial)
+        self.assertNotIn("infomsg:", output_initial)
+
+    def test_table_row_field_is_also_optional(self):
+        model = {
+            "titles": [],
+            "metadata": [],
+            "fields": [],
+            "errmsgField": None,
+            "infomsgField": None,
+            "tables": [{"columns": ["CRDSEL"], "columnKind": {"CRDSEL": "output"}}],
+        }
+        _, output_type, _, _ = build_state_types(model)
+        self.assertIn("crdselRows?: any;", output_type)
 
 
 if __name__ == "__main__":
