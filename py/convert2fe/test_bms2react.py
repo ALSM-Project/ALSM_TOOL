@@ -80,8 +80,7 @@ class ClassifyFieldTests(unittest.TestCase):
 class DetectFunctionKeysTests(unittest.TestCase):
     def test_parses_the_real_cosgn00_legend_line(self):
         label_fields = [{"initial": "ENTER=Sign-on  F3=Exit"}]
-        used = set()
-        keys = detect_function_keys(label_fields, used)
+        keys = detect_function_keys(label_fields)
         self.assertEqual(
             keys,
             [
@@ -89,11 +88,10 @@ class DetectFunctionKeysTests(unittest.TestCase):
                 {"key": "F3", "action": "PF3", "label": "Exit"},
             ],
         )
-        self.assertEqual(len(used), 1)
 
     def test_returns_empty_list_when_no_legend_line_present(self):
         label_fields = [{"initial": "Just some regular instructional text"}]
-        self.assertEqual(detect_function_keys(label_fields, set()), [])
+        self.assertEqual(detect_function_keys(label_fields), [])
 
     def test_finds_the_legend_in_a_named_output_field_not_just_unnamed_labels(self):
         # Real CardDemo bug (COACTUP/COCRDSL/COCRDUP/COTRTUP): the legend text is
@@ -104,8 +102,7 @@ class DetectFunctionKeysTests(unittest.TestCase):
         candidate_fields = [
             {"name": "FKEYS", "kind": "output", "initial": "ENTER=Process F3=Exit"},
         ]
-        used = set()
-        keys = detect_function_keys(candidate_fields, used)
+        keys = detect_function_keys(candidate_fields)
         self.assertEqual(
             keys,
             [
@@ -113,7 +110,6 @@ class DetectFunctionKeysTests(unittest.TestCase):
                 {"key": "F3", "action": "PF3", "label": "Exit"},
             ],
         )
-        self.assertEqual(len(used), 1)
 
     def test_merges_keys_split_across_several_single_key_fields(self):
         # Real CardDemo bug (COTRTLI): instead of one combined legend line, each
@@ -127,10 +123,8 @@ class DetectFunctionKeysTests(unittest.TestCase):
             {"name": "BUTNF08", "kind": "output", "initial": "F8=Page Dn"},
             {"name": "BUTNF10", "kind": "output", "initial": "F10=Save"},
         ]
-        used = set()
-        keys = detect_function_keys(candidate_fields, used)
+        keys = detect_function_keys(candidate_fields)
         self.assertEqual([k["key"] for k in keys], ["F2", "F3", "F7", "F8", "F10"])
-        self.assertEqual(len(used), 5)
 
 
 class DetectRepeatingGroupsTests(unittest.TestCase):

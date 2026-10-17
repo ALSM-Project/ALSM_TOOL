@@ -1,30 +1,37 @@
 '''
 bms2react.py
 
-Converts CICS BMS mapsets (DFHMSD/DFHMDI/DFHMDF) into modern, runnable React 19 +
-TypeScript + Tailwind screens - not a literal 80x24 character-grid replica, but a
-real form/table layout that preserves every piece of business content and every
-function key from the original 3270 map.
+Converts CICS BMS mapsets (DFHMSD/DFHMDI/DFHMDF) into runnable React 19 +
+TypeScript screens that are a faithful, position-accurate replica of the
+original 3270 "green screen": every field keeps its exact BMS row/col/length
+and is placed on a CSS character grid sized to the map's own SIZE=(rows,cols),
+styled dark-terminal/monospace with the real 3270 COLOR mapped to a readable
+equivalent - not a restyled "modern form" that only approximates the content.
 
 Pipeline per BMS file:
   1. extract_map_items()   - parse DFHMSD/DFHMDI/DFHMDF statements into flat dicts,
                               correctly rejoining INITIAL text that continues onto a
                               second physical line (BMS column-72/column-16 rule).
   2. build_screen_model()  - classify every field (input / output / static label /
-                              skip), pair labels+helper text with the field next to
-                              them, detect repeating field groups (e.g. CRDSEL1..7)
+                              skip), detect repeating field groups (e.g. CRDSEL1..7)
                               as table rows, and pull out the function-key legend
-                              line (e.g. "ENTER=Sign-on  F3=Exit"). This model is
-                              also written out as <MAP>.model.json for inspection.
+                              line (e.g. "ENTER=Sign-on  F3=Exit"). Every surviving
+                              field keeps its own row/col/length - there is no
+                              label/helper pairing or header/title extraction,
+                              because placing each field at its real position
+                              reproduces those relationships for free. This model
+                              is also written out as <MAP>.model.json for inspection.
   3. build_component()     - renders the model into a single self-contained .tsx
-                              file: header + metadata bar, body form/table, an
-                              alert region for ERRMSG/INFOMSG, and a footer action
-                              bar wired to both on-screen buttons and real keyboard
-                              shortcuts (Enter/F3/F4/F5/F7/F8/F12).
+                              file: one CSS-grid canvas (sized to the map's real
+                              SIZE=(rows,cols)) holding every field positioned at
+                              its exact gridRow/gridColumn, a repeating-group table
+                              where detected, a conditional ERRMSG/INFOMSG region,
+                              and a window keydown handler wired to the real
+                              function keys (Enter/F3/F4/F5/F7/F8/F12/...).
 
 Author: KhangNV19 (original), extended 2026 to follow the BMS->React modernization
-spec (intermediate model, real field classification, semantic color tokens,
-repeating-group tables, PF-key wiring, ERRMSG/INFOMSG alerts).
+spec (intermediate model, real field classification, position-accurate terminal
+replica, repeating-group tables, PF-key wiring, ERRMSG/INFOMSG alerts).
 '''
 import argparse
 import os
@@ -36,25 +43,34 @@ import json
 # Constants
 # ---------------------------------------------------------------------------
 
-# 3270 COLOR -> semantic Tailwind token (never emit the raw 3270 color name into
-# the generated code - it rarely has usable contrast on a light background).
+# 3270 COLOR -> Tailwind text color readable on the black terminal background the
+# generated screen now renders on, matching a real TN3270 emulator's palette
+# instead of being restyled for a light modern UI.
 COLOR_TOKEN_MAP = {
-    'BLUE': 'text-slate-600',
-    'TURQUOISE': 'text-slate-800',
-    'GREEN': '',
-    'YELLOW': 'text-blue-900 font-bold',
-    'RED': 'text-red-600',
-    'PINK': 'text-amber-600',
-    'NEUTRAL': 'text-gray-700',
-    'DEFAULT': 'text-gray-700',
+    'BLUE': 'text-blue-400',
+    'TURQUOISE': 'text-cyan-400',
+    'GREEN': 'text-green-400',
+    'YELLOW': 'text-yellow-300',
+    'RED': 'text-red-400',
+    'PINK': 'text-pink-400',
+    'NEUTRAL': 'text-slate-200',
+    # No COLOR= clause at all defaults to classic green-screen green, not black-on-black.
+    'DEFAULT': 'text-green-400',
 }
 
 # BMS HILIGHT value -> extra Tailwind class (on top of BRT -> font-semibold).
 HILIGHT_TOKEN_MAP = {
     'UNDERLINE': 'underline',
     'BLINK': 'animate-pulse',
-    'REVERSE': 'font-semibold',
+    # Real inverse video: swap foreground/background instead of just bolding text.
+    'REVERSE': 'bg-green-400 text-black',
 }
+
+# A real 3270 Model 2 screen is 24 rows x 80 columns; DFHMDI's own SIZE=(rows,cols)
+# overrides this when present. The generated grid is sized to this exactly so every
+# field's row/col lines up pixel-for-pixel with the original map.
+DEFAULT_GRID_ROWS = 24
+DEFAULT_GRID_COLS = 80
 
 # Real function-key legend line, e.g. "ENTER=Sign-on  F3=Exit  F7=Backward F8=Forward".
 # Real CardDemo maps use either convention - COPAU01 double-spaces between keys, but
@@ -71,11 +87,6 @@ FUNCTION_KEY_LEGEND_RE = re.compile(
 
 # Repeating field group naming convention, e.g. CRDSEL1, ACCTNO12
 GROUP_NAME_RE = re.compile(r'^([A-Za-z]+)(\d{1,3})$')
-
-# Header metadata (Tran/Prog/Date/Time/AppID/SysID-style fields) only ever sits in
-# the top few rows of a real BMS map; used to separate it from the page title and
-# from the main body content without hardcoding any specific field name.
-HEADER_MAX_ROW = 3
 
 # A field's own INITIAL is a pure placeholder/underline (not real text) when it is
 # entirely made of one decorative character (e.g. '________' on a password field).
@@ -176,6 +187,7 @@ def extract_property(current_item):
     pattern_term = re.compile(r"TERM\s*=\s*([A-Za-z0-9]+)")
     pattern_tioapfx = re.compile(r"TIOAPFX\s*=\s*([A-Z]+)")
     pattern_pos = re.compile(r"POS=\((\d+),(\d+)\)")
+    pattern_size = re.compile(r"SIZE=\((\d+),(\d+)\)")
     pattern_length = re.compile(r"LENGTH=(\d+)")
     pattern_initial = re.compile(r"INITIAL='(.*?)'", re.DOTALL)
     pattern_title = re.compile(r"TITLE \'(.+?)\'")
@@ -229,6 +241,9 @@ def extract_property(current_item):
         data["pos"] = [m.group(1), m.group(2)]
         data["row"] = int(m.group(1))
         data["col"] = int(m.group(2))
+    if pattern_size.search(current_item):
+        m = pattern_size.search(current_item)
+        data["size"] = (int(m.group(1)), int(m.group(2)))
     if pattern_length.search(current_item):
         search = pattern_length.search(current_item).group(0)
         data["length"] = int(get_value(search))
@@ -309,6 +324,15 @@ def is_field_definition(item):
     return item.get("define") == "DFHMDF" and "length" in item
 
 
+def extract_grid_size(map_items):
+    """Real screen dimensions from the map's own DFHMDI SIZE=(rows,cols), falling
+    back to the standard 3270 Model 2 size (24x80) when absent."""
+    for item in map_items:
+        if item.get("define") == "DFHMDI" and "size" in item:
+            return item["size"]
+    return (DEFAULT_GRID_ROWS, DEFAULT_GRID_COLS)
+
+
 def classify_field(field):
     """
     Classifies one DFHMDF field per the modernization spec:
@@ -359,48 +383,23 @@ def is_decorative_initial(text):
     return bool(DECORATIVE_INITIAL_RE.match(text or ""))
 
 
-def find_left_label(field, labels_by_row, used_label_ids):
-    """Nearest unused static-text field on the same row, to the left, ending in ':'."""
-    row = field.get("row")
-    col = field.get("col", 0)
-    candidates = [
-        f for f in labels_by_row.get(row, [])
-        if id(f) not in used_label_ids and f.get("col", 0) < col and (f.get("initial") or "").rstrip().endswith(":")
-    ]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda f: f.get("col", 0))
 
 
-def find_right_helper(field, labels_by_row, used_label_ids):
-    """Nearest unused static-text field on the same row, to the right, in parentheses."""
-    row = field.get("row")
-    col = field.get("col", 0)
-    candidates = [
-        f for f in labels_by_row.get(row, [])
-        if id(f) not in used_label_ids
-        and f.get("col", 0) > col
-        and (f.get("initial") or "").strip().startswith("(")
-        and (f.get("initial") or "").strip().endswith(")")
-    ]
-    if not candidates:
-        return None
-    return min(candidates, key=lambda f: f.get("col", 0))
-
-
-def detect_function_keys(candidate_fields, used_label_ids):
+def detect_function_keys(candidate_fields):
     """
-    Finds the function-key legend line (e.g. "ENTER=Sign-on  F3=Exit") among the
-    candidate fields and returns the parsed [{key, label}] list. The matched
-    field is marked as used so it is not also rendered a second time.
+    Finds the function-key legend line(s) (e.g. "ENTER=Sign-on  F3=Exit") among the
+    candidate fields and returns the parsed, merged [{key, action, label}] list used
+    to wire the real keyboard handler. This is a pure scan - every field keeps
+    rendering normally wherever build_screen_model places it (the legend text is
+    real on-screen content too, not something to hide once parsed).
 
     The legend is usually unnamed static text (kind 'label'), but some BMS maps
     (e.g. CardDemo's COACTUP/COCRDSL/COCRDUP/COTRTUP) instead give this same text
     to a NAMED, protected field (e.g. "FKEYS") so the program can swap it at
     runtime - classify_field() correctly calls that 'output', not 'label', per
     real BMS semantics. Scanning only 'label' fields silently dropped the legend
-    - and with it every button/keyboard handler - on exactly those screens.
-    candidate_fields must include both kinds so this is found either way.
+    - and with it every keyboard handler - on exactly those screens. candidate_fields
+    must include both kinds so this is found either way.
 
     Some maps (e.g. CardDemo's COTRTLI) go further and split the legend across
     several separate single-key fields (BUTNF02="F2=Add", BUTNF03="F3=Exit", ...)
@@ -413,7 +412,6 @@ def detect_function_keys(candidate_fields, used_label_ids):
         text = field.get("initial") or ""
         matches = list(FUNCTION_KEY_LEGEND_RE.finditer(text))
         if len(matches) >= 1 and "=" in text:
-            used_label_ids.add(id(field))
             for m in matches:
                 raw_key = m.group(1).upper()
                 label = m.group(2).strip()
@@ -481,107 +479,68 @@ def detect_repeating_groups(fields):
 
 def build_screen_model(map_items, map_name):
     """
-    Builds the intermediate model described by the modernization spec: classified
-    fields, label/helper pairing, header metadata, repeating tables, and the
-    function-key legend - everything the codegen step needs, and exactly what gets
-    written out to <MAP>.model.json for inspection.
+    Builds the intermediate model for a position-accurate terminal replica: every
+    surviving field keeps its own real row/col/length/color so the codegen step can
+    place it on a CSS grid cell-for-cell with the original 3270 map. There is no
+    label/helper pairing and no separate header/title extraction - placing every
+    field (label, input, output) at its own real position already reproduces
+    whatever visual relationship it had with its neighbors in the source map, for
+    free. This model is also written out as <MAP>.model.json for inspection.
     """
+    grid_rows, grid_cols = extract_grid_size(map_items)
+
     fields = [f for f in map_items if is_field_definition(f)]
     for f in fields:
         f["kind"] = classify_field(f)
 
-    labels_by_row = {}
-    for f in fields:
-        if f["kind"] == "label":
-            labels_by_row.setdefault(f.get("row"), []).append(f)
-
-    used_label_ids = set()
-    function_keys = detect_function_keys(
-        [f for f in fields if f["kind"] in ("label", "output")], used_label_ids
-    )
-
-    interactive = [
-        f for f in fields if f["kind"] in ("input", "output") and id(f) not in used_label_ids
-    ]
-    for f in interactive:
-        left = find_left_label(f, labels_by_row, used_label_ids)
-        if left:
-            used_label_ids.add(id(left))
-            f["label"] = left.get("initial", "").rstrip().rstrip(":").strip()
-        else:
-            f["label"] = f.get("name", "")
-        helper = find_right_helper(f, labels_by_row, used_label_ids)
-        if helper:
-            used_label_ids.add(id(helper))
-            f["helper"] = helper.get("initial", "")
-
-    errmsg_field = next((f for f in interactive if (f.get("name") or "").upper() == "ERRMSG"), None)
-    infomsg_field = next((f for f in interactive if (f.get("name") or "").upper() == "INFOMSG"), None)
-    body_candidates = [f for f in interactive if f is not errmsg_field and f is not infomsg_field]
-
-    header_candidates = [f for f in body_candidates if f.get("row", 999) <= HEADER_MAX_ROW]
-    metadata_items = [f for f in header_candidates if f.get("label") and f.get("kind") == "output" and f.get("label") != f.get("name")]
-    title_items = [f for f in header_candidates if f not in metadata_items]
-    remaining = [f for f in body_candidates if f not in header_candidates]
-
-    tables, remaining = detect_repeating_groups(remaining)
-
-    remaining_labels = [
+    visible = [
         f for f in fields
-        if f["kind"] == "label" and id(f) not in used_label_ids
+        if f["kind"] != "skip" and not (f["kind"] == "label" and is_decorative_initial(f.get("initial")))
     ]
+
+    function_keys = detect_function_keys([f for f in visible if f["kind"] in ("label", "output")])
+
+    errmsg_field = next((f for f in visible if (f.get("name") or "").upper() == "ERRMSG"), None)
+    infomsg_field = next((f for f in visible if (f.get("name") or "").upper() == "INFOMSG"), None)
+    body_fields = [f for f in visible if f is not errmsg_field and f is not infomsg_field]
+
+    tables, body_fields = detect_repeating_groups(body_fields)
+
+    def field_record(f):
+        return {
+            "name": f.get("name"),
+            "kind": f.get("kind"),
+            "row": f.get("row"),
+            "col": f.get("col"),
+            "length": f.get("length"),
+            "attrb": f.get("attrb", []),
+            "color": f.get("color"),
+            "hilight": f.get("hilight"),
+            "picin": f.get("picin"),
+            "picout": f.get("picout"),
+            "initial": f.get("initial"),
+            "isDark": "DRK" in f.get("attrb", []),
+            "isNumeric": "NUM" in f.get("attrb", []),
+            "autoFocus": "IC" in f.get("attrb", []),
+        }
 
     return {
         "mapName": map_name,
-        "titles": [
-            {"name": f.get("name"), "row": f.get("row"), "col": f.get("col")}
-            for f in sorted(title_items, key=lambda x: (x.get("row", 0), x.get("col", 0)))
-        ],
-        "metadata": [
-            {
-                "name": f.get("name"),
-                "label": f.get("label"),
-                "initial": f.get("initial", ""),
-                "row": f.get("row"),
-                "col": f.get("col"),
-            }
-            for f in sorted(metadata_items, key=lambda x: (x.get("row", 0), x.get("col", 0)))
-        ],
+        "gridRows": grid_rows,
+        "gridCols": grid_cols,
         "fields": [
-            {
-                "name": f.get("name"),
-                "kind": f.get("kind"),
-                "label": f.get("label"),
-                "helper": f.get("helper"),
-                "row": f.get("row"),
-                "col": f.get("col"),
-                "length": f.get("length"),
-                "attrb": f.get("attrb", []),
-                "color": f.get("color"),
-                "hilight": f.get("hilight"),
-                "picin": f.get("picin"),
-                "picout": f.get("picout"),
-                "initial": f.get("initial"),
-                "isDark": "DRK" in f.get("attrb", []),
-                "isNumeric": "NUM" in f.get("attrb", []),
-                "autoFocus": "IC" in f.get("attrb", []),
-            }
-            for f in sorted(remaining, key=lambda x: (x.get("row", 0), x.get("col", 0)))
+            field_record(f)
+            for f in sorted(body_fields, key=lambda x: (x.get("row", 0), x.get("col", 0)))
         ],
         "tables": tables,
-        "staticText": [
-            {
-                "text": f.get("initial", ""),
-                "row": f.get("row"),
-                "col": f.get("col"),
-                "color": f.get("color"),
-                "className": css_class_for(f),
-            }
-            for f in sorted(remaining_labels, key=lambda x: (x.get("row", 0), x.get("col", 0)))
-            if f.get("row", 0) > HEADER_MAX_ROW and not is_decorative_initial(f.get("initial"))
-        ],
         "errmsgField": errmsg_field.get("name") if errmsg_field else None,
+        "errmsgRow": errmsg_field.get("row") if errmsg_field else None,
+        "errmsgCol": errmsg_field.get("col") if errmsg_field else None,
+        "errmsgLength": errmsg_field.get("length") if errmsg_field else None,
         "infomsgField": infomsg_field.get("name") if infomsg_field else None,
+        "infomsgRow": infomsg_field.get("row") if infomsg_field else None,
+        "infomsgCol": infomsg_field.get("col") if infomsg_field else None,
+        "infomsgLength": infomsg_field.get("length") if infomsg_field else None,
         "functionKeys": function_keys,
     }
 
@@ -598,14 +557,13 @@ def esc(text):
     text node - because BMS content routinely contains '{', '}', '<', '>', '&'
     (ASCII-art banners, box-drawing characters) which JSX would otherwise parse
     as markup/expression syntax instead of literal text.
+
+    Does NOT trim leading/trailing whitespace: on the position-accurate terminal
+    grid, a field's own INITIAL text is sometimes padded with leading spaces to
+    center or indent it within a LENGTH wider than the visible text - stripping
+    that would silently shift it out of its real position.
     """
-    return (text or "").replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ").strip()
-
-
-def esc_multiline(text):
-    """Same as esc(), but keeps embedded newlines (escaped) instead of collapsing
-    them - used for <pre> banner blocks where line breaks are the point."""
-    return (text or "").replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n").strip()
+    return (text or "").replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ")
 
 
 def jsx_text(text):
@@ -617,143 +575,73 @@ def field_var(name):
     return (name or "field").lower()
 
 
-def is_banner_like(text):
-    if not text or len(text) < 15:
-        return False
-    art_chars = sum(1 for c in text if c in "%$=~|+_(){}[]*")
-    return (art_chars / len(text)) > 0.25
+def grid_style(row, col, length):
+    """Inline style placing one element at its real BMS row/col on the character
+    grid - `gridColumn` spans exactly `length` 1ch-wide track columns, so the
+    rendered width always matches the field's declared LENGTH."""
+    return f"style={{{{ gridRow: {row or 1}, gridColumn: '{col or 1} / span {max(length or 1, 1)}' }}}}"
 
 
-def render_titles(titles, field_lookup):
-    lines = []
-    for t in titles:
-        name = t["name"]
-        lines.append(
-            f"<h2 className=\"text-base sm:text-lg font-bold text-blue-900\">"
-            f"{{receivedData.{field_var(name)} || ''}}</h2>"
-        )
-    if not lines:
-        return ""
-    return "<div className=\"space-y-0.5\">\n" + "\n".join(lines) + "\n</div>"
-
-
-def render_metadata_bar(metadata):
-    if not metadata:
-        return ""
-    items = []
-    for m in metadata:
-        name = m["name"]
-        label = jsx_text(m["label"] or name)
-        items.append(
-            "<div><span className=\"text-slate-400\">" + label + "</span>{' '}"
-            "<span className=\"font-mono\">{receivedData." + field_var(name) + " || ''}</span></div>"
-        )
-    return (
-        "<div className=\"flex flex-wrap gap-x-4 gap-y-0.5 text-[11px] text-slate-500\">\n"
-        + "\n".join(items)
-        + "\n</div>"
-    )
-
-
-def render_static_text_block(static_text):
-    if not static_text:
-        return ""
-    groups = []
-    current = []
-    prev_row = None
-    for item in static_text:
-        banner = is_banner_like(item["text"])
-        if banner and (prev_row is None or item["row"] == prev_row + 1) and (not current or current[-1]["banner"]):
-            current.append({**item, "banner": True})
-        else:
-            if current:
-                groups.append(current)
-            current = [{**item, "banner": banner}]
-        prev_row = item["row"]
-    if current:
-        groups.append(current)
-
-    parts = []
-    for group in groups:
-        if len(group) >= 3 and all(g["banner"] for g in group):
-            content = "\\n".join(esc_multiline(g["text"]) for g in group)
-            parts.append(
-                "<pre className=\"font-mono text-xs text-slate-500 leading-tight whitespace-pre-wrap\">{'"
-                + content + "'}</pre>"
-            )
-        else:
-            for g in group:
-                cls = g["className"] or "text-slate-600"
-                parts.append("<p className=\"" + cls + " text-xs\">" + jsx_text(g["text"]) + "</p>")
-    return "<div className=\"space-y-1 my-3\">\n" + "\n".join(parts) + "\n</div>"
-
-
-def render_field(field):
-    name = field["name"]
-    var = field_var(name)
-    label_jsx = jsx_text(field.get("label") or name)
-    helper_text = field.get("helper") or ""
-    length = field.get("length") or 20
-    width_style = f"style={{{{ width: '{min(length, 60)}ch' }}}}"
+def render_positioned_field(field):
+    """Renders one field (label/output/input) at its exact grid position. A label
+    is static text; an output field is read-only server-supplied text; an input
+    is a real <input> the user can type into - all three are just "a cell on the
+    screen" in a position-accurate replica, so there is no label/input pairing or
+    wrapper markup here, unlike a conventional form layout."""
+    row, col, length = field.get("row"), field.get("col"), field.get("length") or 1
+    style = grid_style(row, col, length)
     color_class = css_class_for(field)
 
     if field["kind"] == "input":
+        var = field_var(field["name"])
         input_type = "password" if field.get("isDark") else "text"
-        extra_props = []
+        extra_props = ['autoComplete="off"']
         if field.get("isNumeric"):
             extra_props.append('inputMode="numeric"')
-            extra_props.append(f'pattern="[0-9]{{0,{length}}}"')
         if field.get("autoFocus"):
             extra_props.append("autoFocus")
         extra = " ".join(extra_props)
-        helper_html = (
-            '<p id="' + var + '-helper" className="text-[11px] text-slate-400 mt-0.5">'
-            + jsx_text(helper_text) + "</p>"
-        ) if helper_text else ""
-        return f"""
-<div>
-  <label htmlFor="{var}" className="block text-xs font-semibold {color_class}">{label_jsx}</label>
-  <input
-    id="{var}"
-    name="{var}"
-    type="{input_type}"
-    maxLength={{{length}}}
-    {width_style}
-    {extra}
-    value={{formData.{var} ?? ''}}
-    onChange={{(e) => handleInputChange('{var}', e.target.value)}}
-    aria-describedby="{var}-helper"
-    className="mt-1 block rounded-md border border-slate-300 px-2 py-1.5 text-sm shadow-sm focus:border-blue-500 focus:ring-blue-500"
-  />
-  {helper_html}
-</div>"""
-    # output field
-    return f"""
-<div>
-  <span className="block text-xs font-semibold {color_class}">{label_jsx}</span>
-  <span className="mt-1 block text-sm text-slate-800 font-mono">{{receivedData.{var} || ''}}</span>
-</div>"""
+        return f"""<input
+          {style}
+          id="{var}"
+          name="{var}"
+          type="{input_type}"
+          maxLength={{{length}}}
+          {extra}
+          disabled={{isLoading}}
+          value={{formData.{var} ?? ''}}
+          onChange={{(e) => handleInputChange('{var}', e.target.value)}}
+          className="bg-black {color_class} font-mono border-0 border-b border-dotted border-green-900 focus:outline-none focus:border-solid focus:border-cyan-400 disabled:opacity-60"
+        />"""
 
-
-def render_body_fields(fields):
-    if not fields:
-        return ""
-    items = "\n".join(render_field(f) for f in fields)
-    return f"""
-<div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-{items}
-</div>"""
+    text_jsx = jsx_text(field.get("initial") or "")
+    if field["kind"] == "label":
+        return f'<span {style} className="whitespace-pre {color_class}">{text_jsx}</span>'
+    # output - server-supplied, read from receivedData
+    var = field_var(field["name"])
+    return f'<span {style} className="whitespace-pre {color_class}">{{receivedData.{var} ?? \'\'}}</span>'
 
 
 def render_tables(tables):
+    """A repeating-group list (e.g. CardDemo's COCRDLI card list) still renders as
+    a real HTML table rather than one positioned <span> per cell - the terminal
+    only ever shows a fixed number of visible rows at a time (scrolled via
+    PF7/PF8), so a table is the closer real-world equivalent of the 3270 behavior
+    anyway. It's placed at the grid row just above the table's own first declared
+    data row/column so it still lines up with the rest of the screen, and kept in
+    the same dark/monospace palette as everything else."""
     if not tables:
         return ""
     blocks = []
-    for t_index, table in enumerate(tables):
+    for table in tables:
         columns = table["columns"]
         kind = table["columnKind"]
+        first_col_var = field_var(columns[0])
+        start_row = min((cell.get("row", 999) for row in table["rows"] for cell in row.values()), default=1)
+        start_col = min((cell.get("col", 999) for row in table["rows"] for cell in row.values()), default=1)
+        wrapper_style = f"style={{{{ gridRow: '{max(start_row - 1, 1)} / span 20', gridColumn: '{start_col} / -1' }}}}"
         headers = "".join(
-            "<th className=\"px-3 py-2 text-left font-semibold text-slate-600\">" + jsx_text(col) + "</th>"
+            "<th className=\"px-2 text-left font-normal text-green-600\">" + jsx_text(col) + "</th>"
             for col in columns
         )
         cells = []
@@ -761,65 +649,51 @@ def render_tables(tables):
             var = field_var(col)
             if kind.get(col) == "input":
                 cells.append(
-                    f"<td className=\"px-3 py-1\"><input value={{(formData.{field_var(table['columns'][0])}Rows?.[i]?.{var}) ?? ''}} "
-                    f"onChange={{(e) => handleRowChange('{field_var(table['columns'][0])}', i, '{var}', e.target.value)}} "
-                    f"className=\"w-full rounded border border-slate-300 px-1.5 py-1 text-xs\" /></td>"
+                    f"<td className=\"px-2\"><input value={{(formData.{first_col_var}Rows?.[i]?.{var}) ?? ''}} "
+                    f"onChange={{(e) => handleRowChange('{first_col_var}', i, '{var}', e.target.value)}} "
+                    f"disabled={{isLoading}} className=\"bg-black text-green-400 font-mono border-0 border-b border-dotted border-green-900 focus:outline-none disabled:opacity-60\" /></td>"
                 )
             else:
-                cells.append(f"<td className=\"px-3 py-1.5 font-mono\">{{row.{var} ?? ''}}</td>")
+                cells.append(f"<td className=\"px-2 font-mono text-green-400 whitespace-pre\">{{row.{var} ?? ''}}</td>")
         cells_joined = "".join(cells)
-        blocks.append(f"""
-<div className="overflow-x-auto my-4">
-  <table className="min-w-full text-xs border border-slate-200 rounded-lg overflow-hidden">
-    <thead className="bg-slate-50">
-      <tr>{headers}</tr>
-    </thead>
-    <tbody className="divide-y divide-slate-100">
-      {{(receivedData.{field_var(table['columns'][0])}Rows || []).map((row: any, i: number) => (
-        <tr key={{i}}>{cells_joined}</tr>
-      ))}}
-    </tbody>
-  </table>
-</div>""")
+        blocks.append(f"""<div {wrapper_style} className="overflow-x-auto">
+          <table className="text-xs font-mono border-collapse">
+            <thead><tr>{headers}</tr></thead>
+            <tbody>
+              {{(receivedData.{first_col_var}Rows || []).map((row: any, i: number) => (
+                <tr key={{i}}>{cells_joined}</tr>
+              ))}}
+            </tbody>
+          </table>
+        </div>""")
     return "\n".join(blocks)
 
 
-def render_alert_region(errmsg_field, infomsg_field):
+def render_alert_region(model):
+    """ERRMSG/INFOMSG keep their own real grid position (every real 3270 map has a
+    dedicated message line) instead of floating as a modern alert card - red/green
+    text in place, matching how the original screen actually reports status.
+
+    errMsg itself is always rendered (falling back to the map's last row when the
+    source has no real ERRMSG field) rather than only when model["errmsgField"]
+    exists: errMsg also carries client-side failures (network errors, etc.) that
+    have nothing to do with a named BMS field, and errMsg must be read somewhere
+    regardless - the `useState` declaring it is unconditional - or an otherwise
+    error-free screen fails `tsc -b` with "declared but never read".
+    """
     parts = []
-    if errmsg_field:
-        var = field_var(errmsg_field)
-        parts.append(f"""
-{{errMsg && (
-  <div role="alert" className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-    {{errMsg}}
-  </div>
-)}}""")
-    if infomsg_field:
-        var = field_var(infomsg_field)
-        parts.append(f"""
-{{receivedData.{var} && (
-  <div role="status" className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-700">
-    {{receivedData.{var}}}
-  </div>
-)}}""")
-    return "\n".join(parts)
-
-
-def render_action_bar(function_keys):
-    if not function_keys:
-        return ""
-    buttons = []
-    for fk in function_keys:
-        label_jsx = jsx_text(fk["label"])
-        buttons.append(
-            f"""<button type="button" disabled={{isLoading}} onClick={{() => submitAction('{fk['action']}')}} """
-            f"""className="px-4 py-2 text-xs font-semibold rounded-md border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-50">{label_jsx}</button>"""
+    if model["errmsgField"]:
+        style = grid_style(model["errmsgRow"], model["errmsgCol"], model["errmsgLength"])
+    else:
+        style = grid_style(model["gridRows"], 1, model["gridCols"])
+    parts.append(f'{{errMsg && <span {style} role="alert" className="whitespace-pre text-red-400">{{errMsg}}</span>}}')
+    if model["infomsgField"]:
+        var = field_var(model["infomsgField"])
+        style = grid_style(model["infomsgRow"], model["infomsgCol"], model["infomsgLength"])
+        parts.append(
+            f'{{receivedData.{var} && <span {style} role="status" className="whitespace-pre text-green-400">{{receivedData.{var}}}</span>}}'
         )
-    return (
-        '<div className="flex flex-wrap gap-2 pt-4 border-t border-slate-100">\n'
-        + "\n".join(buttons)
-        + "\n</div>"
-    )
+    return "\n".join(parts)
 
 
 def render_function_key_effect(function_keys):
@@ -847,10 +721,6 @@ def render_function_key_effect(function_keys):
 def build_state_types(model):
     output_names = set()
     input_names = set()
-    for f in model["titles"]:
-        output_names.add(field_var(f["name"]))
-    for m in model["metadata"]:
-        output_names.add(field_var(m["name"]))
     for f in model["fields"]:
         if f["kind"] == "output":
             output_names.add(field_var(f["name"]))
@@ -895,24 +765,16 @@ def build_state_types(model):
         if f["kind"] == "output":
             init = esc(f.get("initial") or "")
             output_initial_parts.append(f"{field_var(f['name'])}: '{init}',")
-    for m in model["metadata"]:
-        init = esc(m.get("initial") or "")
-        output_initial_parts.append(f"{field_var(m['name'])}: '{init}',")
-    for t in model["titles"]:
-        output_initial_parts.append(f"{field_var(t['name'])}: '',")
     output_initial = "\n    ".join(output_initial_parts)
     return input_type, output_type, input_initial, output_initial
 
 
 def build_component(model):
     map_name = model["mapName"]
-    titles_jsx = render_titles(model["titles"], None)
-    metadata_jsx = render_metadata_bar(model["metadata"])
-    static_jsx = render_static_text_block(model["staticText"])
-    body_jsx = render_body_fields(model["fields"])
+    grid_rows, grid_cols = model["gridRows"], model["gridCols"]
+    fields_jsx = "\n          ".join(render_positioned_field(f) for f in model["fields"])
     tables_jsx = render_tables(model["tables"])
-    alert_jsx = render_alert_region(model["errmsgField"], model["infomsgField"])
-    action_bar_jsx = render_action_bar(model["functionKeys"])
+    alert_jsx = render_alert_region(model)
     key_effect = render_function_key_effect(model["functionKeys"])
     input_type, output_type, input_initial, output_initial = build_state_types(model)
 
@@ -1001,16 +863,24 @@ export function {map_name}() {{
   }};
 {key_effect}
   return (
-    <div className="max-w-3xl mx-auto my-6 px-4 space-y-4">
-      <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2 border-b border-slate-100 pb-3">
-        {titles_jsx}
-        {metadata_jsx}
+    <div className="min-h-screen bg-black flex items-start justify-center p-4">
+      <div
+        className="relative bg-black text-green-400 font-mono text-[13px] leading-[1.35] p-3 border border-green-900 rounded shadow-[0_0_25px_rgba(34,197,94,0.12)] overflow-x-auto"
+        style={{{{
+          display: 'grid',
+          gridTemplateColumns: 'repeat({grid_cols}, 1ch)',
+          gridTemplateRows: 'repeat({grid_rows}, 1.35em)',
+          width: 'max-content',
+          minWidth: '100%',
+        }}}}
+      >
+          {fields_jsx}
+          {tables_jsx}
+          {alert_jsx}
+          {{isLoading && (
+            <span style={{{{ gridRow: {grid_rows}, gridColumn: '{max(grid_cols - 9, 1)} / span 9' }}}} className="text-yellow-300 animate-pulse">{{'...WAIT...'}}</span>
+          )}}
       </div>
-      {static_jsx}
-      {alert_jsx}
-      {body_jsx}
-      {tables_jsx}
-      {action_bar_jsx}
     </div>
   );
 }}
